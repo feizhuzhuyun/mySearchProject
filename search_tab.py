@@ -10,6 +10,11 @@ from scanner import ScanWorker, ScanThread
 from widgets import Card, Placeholder
 from settings_dialog import SettingsDialog
 
+try:
+    from models import get_instance as _get_model_instance
+except ImportError:
+    _get_model_instance = None
+
 class SearchTab(QWidget):
     """📦 图片检索 — 搜索框 + 左侧文件夹列表 + 右侧图片网格。"""
 
@@ -161,6 +166,43 @@ class SearchTab(QWidget):
         self.search_input.textChanged.connect(self._on_input_changed)
         self.search_input.returnPressed.connect(self._on_search)
 
+    # 当前高亮的行容器引用（用于取消旧选中）
+    _selected_row: "QWidget | None" = None
+    _SELECTION_STYLE = "background-color: #F0FFF0; border-radius: 4px;"
+
+    def _highlight_row(self, item: QListWidgetItem):
+        """给 item 的行容器设置稳定选中底色，同时清除旧选中。"""
+        if self._selected_row is not None:
+            try:
+                self._selected_row.setStyleSheet("")
+            except RuntimeError:
+                pass
+            self._selected_row = None
+
+        row = self.result_list.itemWidget(item)
+        if row is not None:
+            row.setStyleSheet(self._SELECTION_STYLE)
+            self._selected_row = row
+
+    def _auto_select_first(self):
+        """搜索完成后自动选中第一个结果 + 加载缩略图。"""
+        if self.result_list.count() == 0:
+            self._show_placeholder_right()
+            return
+        first = self.result_list.item(0)
+        folder_path = first.data(Qt.ItemDataRole.UserRole)
+        if not folder_path:
+            self._show_placeholder_right()
+            return
+
+        self.result_list.setCurrentItem(first)
+        self.result_list.scrollToTop()
+        self._highlight_row(first)
+
+        full = self._resolve_path(folder_path)
+        self.path_bar.setText(full or folder_path)
+        self._load_thumbnails(folder_path)
+
     # ── 搜索分发 ──────────────────────────────────────────────────
     def _on_input_changed(self, _text: str):
         """每次击键重置计时器，停止输入 400ms 后自动搜索。"""
@@ -174,7 +216,19 @@ class SearchTab(QWidget):
             self._show_placeholder_right()
             self.path_bar.setText("请选择左侧结果")
             return
-        if query.isdigit():
+
+        # 通过模型插件体系解析查询意图
+        analyzer = _get_model_instance("query_analyzers", "LocalQueryAnalyzer") if _get_model_instance else None
+        if analyzer is not None:
+            intent = analyzer.analyze(query)
+        else:
+            # 降级：插件不可用时直接判断
+            if query.isdigit():
+                intent = type("Intent", (), {"mode": "code", "include_terms": [query]})()
+            else:
+                intent = type("Intent", (), {"mode": "keyword", "include_terms": [query]})()
+
+        if intent.mode == "code":
             self._do_code_search(query)
         else:
             self._do_keyword_search(query)
@@ -184,7 +238,7 @@ class SearchTab(QWidget):
         results = self._db.search_folders_by_code_tail(query)
         self._search_results = results
         self._populate_list(results)
-        self._show_placeholder_right()
+        self._auto_select_first()
         n = len(query)
         if n < 4:
             hint = f"（输入 {4-n} 位以精确匹配）"
@@ -201,7 +255,7 @@ class SearchTab(QWidget):
         results = self._db.search_folders_by_keyword(query)
         self._search_results = results
         self._populate_list(results)
-        self._show_placeholder_right()
+        self._auto_select_first()
         self.status_label.setText(
             f"关键字搜索 \"{query}\" — {len(results)} 个结果"
         )
@@ -245,13 +299,10 @@ class SearchTab(QWidget):
             img_count = r.get("image_count", 0)
             folder_path = r.get("folder_path", "")
 
-            # ── 行容器 ──
+            # ── 行容器（点击非按钮区域 → 加载缩略图） ──
             row = QWidget()
             row.setCursor(Qt.CursorShape.PointingHandCursor)
-            # 点击整行 → 加载缩略图
-            row.mousePressEvent = (
-                lambda e, fp=folder_path: self._on_item_click(fp)
-            )
+
             vbox = QVBoxLayout(row)
             vbox.setContentsMargins(6, 4, 6, 4)
             vbox.setSpacing(1)
@@ -279,8 +330,25 @@ class SearchTab(QWidget):
             hint.setHeight(hint.height() + 6)
             item = QListWidgetItem()
             item.setSizeHint(hint)
+            item.setData(Qt.ItemDataRole.UserRole, folder_path)
             self.result_list.addItem(item)
             self.result_list.setItemWidget(item, row)
+
+            def _make_row_handler(_row, _fp, _item):
+                def _handler(event):
+                    child = _row.childAt(event.position().toPoint())
+                    if child is not None:
+                        if isinstance(child, QPushButton):
+                            return
+                        p = child.parent()
+                        while p and p is not _row:
+                            if isinstance(p, QPushButton):
+                                return
+                            p = p.parent()
+                    self._on_item_click(_fp, _item)
+                return _handler
+
+            row.mousePressEvent = _make_row_handler(row, folder_path, item)
 
         self._all_codes = [r.get("full_code", "") for r in results if r.get("full_code")]
         self.btn_copy_codes.setVisible(has_codes)
@@ -343,13 +411,28 @@ class SearchTab(QWidget):
         if btn is not None:
             QToolTip.showText(btn.mapToGlobal(QPoint(0, -28)), "已复制！", btn)
 
-    def _on_item_click(self, folder_path: str):
-        """点击列表项 → 加载缩略图 + 显示路径。"""
+    def _resolve_path(self, rel_path: str) -> str:
+        """在多个 NAS 路径中查找第一个存在的完整路径。"""
+        if os.path.isabs(rel_path):
+            return rel_path if os.path.exists(rel_path) else ""
+        for root in self._cfg.nas_root_paths:
+            full = os.path.join(root, rel_path)
+            if os.path.exists(full):
+                return full
+        # 回退到第一个路径
+        if self._cfg.nas_root_paths:
+            return os.path.join(self._cfg.nas_root_paths[0], rel_path)
+        return rel_path
+
+    def _on_item_click(self, folder_path: str, item: QListWidgetItem | None = None):
+        """点击列表项 → 高亮行 + 加载缩略图 + 显示路径。"""
         if not folder_path:
             return
-        root = self._cfg.nas_root_path
-        full = os.path.join(root, folder_path) if not os.path.isabs(folder_path) else folder_path
-        self.path_bar.setText(full)
+        if item is not None:
+            self.result_list.setCurrentItem(item)
+            self._highlight_row(item)
+        full = self._resolve_path(folder_path)
+        self.path_bar.setText(full or folder_path)
         self._load_thumbnails(folder_path)
 
     # ── 复制行为 ──────────────────────────────────────────────────
@@ -389,8 +472,7 @@ class SearchTab(QWidget):
                 child.widget().deleteLater()
 
     def _load_thumbnails(self, folder_path: str):
-        """加载并展示某文件夹下的图片缩略图。"""
-        # 检查缓存
+        """同步加载缩略图（setScaledSize 已很快，processEvents 防卡顿）。"""
         if folder_path in self._thumb_cache:
             self._render_thumb_grid(self._thumb_cache[folder_path])
             return
@@ -400,21 +482,20 @@ class SearchTab(QWidget):
             self.status_label.setText("该文件夹无图片")
             return
 
-        root = self._cfg.nas_root_path
         pixmaps = []
-        for img in images:
+        for i, img in enumerate(images):
             full_path = img["full_unc"]
-            # 如果路径是相对路径，拼接 NAS 根目录
             if not os.path.isabs(full_path):
-                full_path = os.path.join(root, full_path)
-            # 方案1：QImageReader 直接解码到目标尺寸，跳过全分辨率 → 快 10-50x
+                full_path = self._resolve_path(full_path)
             reader = QImageReader(full_path)
             reader.setAutoTransform(True)
             reader.setScaledSize(QSize(200, 160))
             pix = QPixmap.fromImageReader(reader)
             pixmaps.append((pix if not pix.isNull() else QPixmap(), img))
+            # 每 5 张让事件循环喘口气，UI 不冻结
+            if i % 5 == 0:
+                QApplication.processEvents()
 
-        # 缓存（最多保留 3 个文件夹）
         if len(self._thumb_cache) >= 3:
             oldest = next(iter(self._thumb_cache))
             del self._thumb_cache[oldest]
@@ -468,9 +549,8 @@ class SearchTab(QWidget):
         """在资源管理器中打开文件夹。"""
         if not folder_path:
             return
-        root = self._cfg.nas_root_path
-        full = os.path.join(root, folder_path) if not os.path.isabs(folder_path) else folder_path
-        if os.path.exists(full):
+        full = self._resolve_path(folder_path)
+        if full and os.path.exists(full):
             os.startfile(full)
 
     # ── 工具栏按钮事件 ──────────────────────────────────────────────
@@ -505,77 +585,67 @@ class SearchTab(QWidget):
             self.status_changed.emit()
 
     def _start_scan(self, incremental: bool):
-        """启动后台扫描线程。"""
-        # 防止重复启动
+        """启动后台扫描线程（支持多 NAS 路径）。"""
         running = False
         if self._scan_thread is not None:
             try:
                 running = self._scan_thread.isRunning()
             except RuntimeError:
-                pass  # C++ 对象已被 deleteLater 回收 → 视为未运行
+                pass
         if running:
-            QMessageBox.information(
-                self, "扫描进行中",
-                "上一次扫描尚未完成，请等待完成后再试。"
-            )
+            QMessageBox.information(self, "扫描进行中", "上一次扫描尚未完成，请等待完成后再试。")
             return
 
-        # 旧线程已停止 → 安全清空引用（deleteLater 会处理 C++ 资源）
         self._scan_thread = None
         self._scan_worker = None
 
-        root = self._cfg.nas_root_path
-        if not root:
+        paths = self._cfg.nas_root_paths
+        if not paths:
             QMessageBox.information(
                 self, "未配置 NAS 路径",
                 "尚未配置 NAS 图片根目录。\n\n"
-                "请点击工具栏右侧的 ⚙️ 按钮打开设置，"
-                "选择图片所在的根目录后再进行扫描。"
+                "请点击工具栏右侧的 ⚙️ 按钮打开设置，选择图片所在的根目录后再进行扫描。"
             )
             return
 
-        # 目录存在性检查
-        if not os.path.exists(root):
-            QMessageBox.critical(
-                self, "路径不存在",
-                f"图片根目录不存在或无法访问：\n{root}\n\n"
-                "请在配置中修改为有效路径。"
-            )
-            return
-
-        # 全量扫描前清空索引（保留产品数据）
+        # 全量扫描前清空索引
         if not incremental:
             self._db.clear_index()
 
-        # 禁用按钮
         self._set_buttons_enabled(False)
         self.status_label.setText("扫描中…")
 
-        last_scan = self._cfg.last_scan_time if incremental else 0.0
+        times = {}
+        if incremental:
+            for p in paths:
+                times[p] = self._cfg.get_scan_time(p)
 
         self._scan_worker = ScanWorker(
-            self._db, root,
+            self._db, paths,
             incremental=incremental,
-            last_scan_time=last_scan,
+            last_scan_times=times,
         )
-        # 使用 ScanThread（重写 run 直接调 worker.run，避免 started 信号时序问题）
         self._scan_thread = ScanThread(self._scan_worker)
+        self._scan_worker.moveToThread(self._scan_thread)
 
-        # 连接信号
         self._scan_worker.progress.connect(self._on_scan_progress)
+        self._scan_worker.path_label.connect(self._on_scan_path)
         self._scan_worker.status_message.connect(self._on_scan_status)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
 
-        # 线程清理链
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._scan_thread.finished.connect(self._scan_worker.deleteLater)
 
         self._scan_thread.start()
 
+    def _on_scan_path(self, label: str):
+        """当前扫描的路径标签。"""
+        self.status_label.setText(f"扫描 {label}")
+
     def _on_scan_progress(self, current: int, total: int):
-        self.status_label.setText(f"扫描中… {current}/{total}")
+        self.status_label.setText(f"{self.status_label.text().split(' —')[0]} — {current}/{total}")
 
     def _on_scan_status(self, msg: str):
         self.status_label.setText(msg)
@@ -583,8 +653,8 @@ class SearchTab(QWidget):
     def _on_scan_finished(self, stats: dict):
         self._set_buttons_enabled(True)
         import time
-        self._cfg.last_scan_time = time.time()
-        # 持久化完成消息
+        for p in self._cfg.nas_root_paths:
+            self._cfg.set_scan_time(p, time.time())
         files = stats.get("files", 0)
         folders = stats.get("folders", 0)
         linked = stats.get("linked", 0)

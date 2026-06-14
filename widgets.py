@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QFrame,QHBoxLayout,QLabel,QMainWindow,QPushButton
 
 # Constants
 TITLE_BAR_HEIGHT = 38
-APP_NAME = ""
+APP_NAME = "元器件图片检索"
 APP_VERSION = "0.0.1"
 
 class TitleBar(QFrame):

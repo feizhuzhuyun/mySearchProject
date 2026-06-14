@@ -65,10 +65,11 @@ class Database:
                     code_tail   TEXT NOT NULL
                 );
 
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_folder_codes_unique
+                    ON folder_codes(folder_path, code_tail);
+
                 CREATE INDEX IF NOT EXISTS idx_folder_codes_code_tail
                     ON folder_codes(code_tail);
-                CREATE INDEX IF NOT EXISTS idx_folder_codes_folder_path
-                    ON folder_codes(folder_path);
 
                 CREATE TABLE IF NOT EXISTS product_folder_link (
                     product_id  INTEGER NOT NULL,
@@ -78,17 +79,47 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_pfl_folder_path
                     ON product_folder_link(folder_path);
+
+                CREATE TABLE IF NOT EXISTS product_attrs (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id   INTEGER NOT NULL,
+                    attr_name  TEXT    NOT NULL,
+                    attr_value TEXT    NOT NULL,
+                    UNIQUE(image_id, attr_name, attr_value)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_product_attrs_name
+                    ON product_attrs(attr_name);
+                CREATE INDEX IF NOT EXISTS idx_product_attrs_image
+                    ON product_attrs(image_id);
             """)
 
-            # ── 迁移：添加 code_tail 列（优化 rebuild_links） ──
+            # ── 迁移：已有表的增量更新 ──
+            # code_tail 列
             try:
                 conn.execute(
                     "ALTER TABLE products ADD COLUMN code_tail TEXT NOT NULL DEFAULT ''"
                 )
             except sqlite3.OperationalError:
-                pass  # 列已存在
+                pass
 
-            # 回填已有产品的 code_tail
+            # images 表阶段 3 预置列（每列都有 DEFAULT，不加 ALTER 时不影响现有数据）
+            _img_cols = [
+                ("feature_extracted", "INTEGER NOT NULL DEFAULT 0"),
+                ("thumbnail_path",    "TEXT    NOT NULL DEFAULT ''"),
+                ("ocr_extracted",     "INTEGER NOT NULL DEFAULT 0"),
+                ("phash",             "INTEGER NOT NULL DEFAULT 0"),
+                ("width",             "INTEGER NOT NULL DEFAULT 0"),
+                ("height",            "INTEGER NOT NULL DEFAULT 0"),
+                ("file_size",         "INTEGER NOT NULL DEFAULT 0"),
+            ]
+            for col_name, col_def in _img_cols:
+                try:
+                    conn.execute(f"ALTER TABLE images ADD COLUMN {col_name} {col_def}")
+                except sqlite3.OperationalError:
+                    pass
+
+            # 回填已有产品的 code_tail（移出循环，只执行一次）
             conn.execute(
                 "UPDATE products SET code_tail = substr(full_code, -4) "
                 "WHERE code_tail = '' AND length(full_code) >= 4"
@@ -201,9 +232,23 @@ class Database:
                        ORDER BY fc.folder_path""",
                     (query,),
                 ).fetchall()
+            elif len(query) >= 13:
+                # 13 位：完整69码精确匹配（利用 UNIQUE 索引）
+                rows = conn.execute(
+                    """SELECT DISTINCT pfl.folder_path,
+                              (SELECT folder_name FROM images
+                               WHERE folder_path = pfl.folder_path LIMIT 1
+                              ) AS folder_name,
+                              p.id AS product_id, p.name AS product_name,
+                              p.full_code
+                       FROM products p
+                       JOIN product_folder_link pfl ON pfl.product_id = p.id
+                       WHERE p.full_code = ?
+                       ORDER BY p.full_code""",
+                    (query,),
+                ).fetchall()
             else:
-                # 1-3 位或 5+ 位：full_code 后缀模糊匹配
-                tail = query[-4:] if len(query) > 4 else query
+                # 1-3 位或 5-12 位：full_code 后缀模糊匹配
                 rows = conn.execute(
                     """SELECT DISTINCT pfl.folder_path,
                               (SELECT folder_name FROM images

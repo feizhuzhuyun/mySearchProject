@@ -382,12 +382,15 @@ class MainWindow(ResizableWindow):
             parts.append(f"关联：{link_count} 组")
         self.status_index.setText(" | ".join(parts))
 
-        # NAS 路径（过长时缩略）
-        root = self._cfg.nas_root_path
-        if root:
-            if len(root) > 30:
-                root = "…" + root[-29:]
-            self.status_path.setText(f"📁 {root}")
+        # NAS 路径（显示第一个，过多时缩略 + 数量）
+        paths = self._cfg.nas_root_paths
+        if paths:
+            label = paths[0]
+            if len(label) > 28:
+                label = "…" + label[-27:]
+            if len(paths) > 1:
+                label += f"  +{len(paths)-1}"
+            self.status_path.setText(f"📁 {label}")
         else:
             self.status_path.setText("📁 未配置")
 
