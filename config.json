@@ -1,9 +1,5 @@
 {
-  "db_path": "data/mysearch.db",
-  "nas_root_paths": [
-    "D:/project/mysearch/test_data/nas_root"
-  ],
-  "last_scan_times": {
-    "D:/project/mysearch/test_data/nas_root": 1781451100.0100143
-  }
+  "nas_root_path": "D:\\project\\mysearch\\test_nas",
+  "last_scan_time": 1782144850.8605173,
+  "db_path": "data/mysearch.db"
 }

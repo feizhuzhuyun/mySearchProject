@@ -1,0 +1,1255 @@
+# 本地电子产品图片智能检索工具 —— 需求与实现蓝图
+
+> **版本**：2.2
+> **日期**：2026-06-23
+> **变更摘要**：
+> - v2.2: 知识库管理标签页、三数据源独立追踪、产品级数据完整性矩阵、右侧面板动态规格
+> - v2.1: 动态规格表(product_specs)、CSV图片下载、独立知识库构建工具、右侧面板重构
+> - v2.0: 整合 v1.0 + v2.1 蓝图，product_groups + image_sets 数据模型
+
+---
+
+## 目录
+1. [项目概述](#1-项目概述)
+2. [真实数据特征](#2-真实数据特征)
+3. [功能需求](#3-功能需求)
+4. [数据设计](#4-数据设计)
+5. [产品库与 LLM 前置识别](#5-产品库与-llm-前置识别)
+6. [技术选型](#6-技术选型)
+7. [分阶段实现路线图](#7-分阶段实现路线图)
+8. [版本控制与回退策略](#8-版本控制与回退策略)
+9. [可扩展接口设计](#9-可扩展接口设计)
+
+---
+
+## 1. 项目概述
+
+### 1.1 项目背景
+NAS 中存储大量电子元器件产品图片，主要目录为：
+  - `K:\1.图片\2.转接卡`（约 642 个文件夹）
+  - `K:\1.图片\13.PCIE延长线`（约 178 个文件夹）
+
+CSV 商品表（店小秘导出）共 **1405 个产品**，其中：
+  - **1225 个**使用 69 码作为主标识（87%）
+  - **180 个**使用自定义 SKU（13%）
+  - 产品分类覆盖 20+ 个类别：转接卡、延长线、硬盘盒、散热片、数据线、风扇、支架、水晶头、模块、护套、快充、电源、转接板、网线钳、阵列卡、增高卡、拆分卡 等
+
+实际目录结构远比最初设想的复杂：
+  - 一个文件夹常包含多个 SKU（多颜色、多尺寸、多版本）
+  - 一个产品文件夹下有多个语言子文件夹（中文/英语/西班牙语/俄语/韩语/印尼语/泰语/法文）
+  - 存在渲染图、实拍图、亚马逊素材、停售素材等用途子文件夹
+  - 文件夹名中的 69 码后四位可能缺失、多个、或位于子文件夹名中
+
+现有查找方式低效：
+  - 在 ERP 中按 69 码后四位查找，再手动定位文件夹；
+  - 新人拿到无信息白底图时，几乎无法找到对应图片；
+  - 仅知道参数（如 "PCIE 4.0"）时，不能快速定位相关文件夹。
+
+### 1.2 核心目标
+- **统一搜索入口**：一个输入框支持文字、数字、拖图，自动分派搜索模式。
+- **产品组为核心**：一个文件夹 = 一个产品组（product_group），组下可含多个 SKU 变体。
+- **图片集管理**：同一产品组下的多语言/多用途图片按 image_set 组织，选择性索引。
+- **打通产品与图片**：导入 CSV 后，通过 69 码后四位 + 文件夹名分词关联产品组。
+- **多数据源融合**：CSV（主数据）+ LLM JSONL（图片分析）+ 文件夹结构 → SQLite。
+- **离线优先**：核心检索完全离线运行；AI 助手为可选功能，需用户自行配置 API Key。
+- **LLM 前置识别**：AI 分析输出 products.jsonl，扫描器离线运行，两者解耦。
+
+### 1.3 架构概览
+
+```
+  [CSV 商品表] ──┐
+                 ├──→ [产品库构建] ──→ [SQLite 数据库]
+  [LLM JSONL] ──┘                            ↑
+                                              │
+  [NAS 扫描] ──→ [image_sets / images] ──────┘
+                 [PaddleOCR 文字] ──→ [keyword_index]
+                 [CLIP 特征] ──→ [FAISS 索引]
+                      │
+                      ↓
+              [SearchDispatcher]
+                      │
+        ┌───────┬───────┼───────┐
+        ↓       ↓       ↓       ↓
+      69码    关键字   以图搜图  交集搜索
+                      │
+                      ↓
+         ┌─────────────────────────┐
+         │    搜索结果（产品优先）    │
+         │  ┌──────────┬─────────┐ │
+         │  │ 左侧      │ 右侧     │ │
+         │  │ 产品卡片  │ 详情面板  │ │
+         │  │ ·主图     │ ·全部图片 │ │
+         │  │ ·69码    │ ·规格参数 │ │
+         │  │ ·名称     │ ·关联信息 │ │
+         │  └──────────┴─────────┘ │
+         └─────────────────────────┘
+```
+
+---
+
+## 2. 真实数据特征
+
+### 2.1 关键发现（基于 mock-data 验证）
+
+**(1) 文件夹层级深**
+产品根文件夹下通常包含：
+  - 中文 / 英语 / 西班牙语 / 俄语 / 韩语 / 印尼语 / 泰语 / 法文（语言子文件夹）
+  - 渲染图
+  - 实拍图
+  - 亚马逊
+  - 停售 / 停用
+  - 主图 / 详情
+
+**(2) 多 SKU 合并是常态**
+典型文件夹名：
+  - `10.型号：冷雨燕 黑 型号：冷雨燕 红 2180 1961`
+  - `15.型号：保护板一号 型号：保护板二号 6638 6645`
+  - `39.增高卡 型号：ZX51827 型号：ZX51818 型号：ZX51890 3628 3321 3611`
+
+**(3) 多语言图片本质重复**
+英语/1.jpg、西班牙语/1.jpg、俄语/1.jpg 往往是同一张图换文字，不应全部做 CLIP 向量，否则浪费空间和算力。
+
+**(4) 69 码来源多样**
+- 文件夹名中的后四位
+- 子文件夹名中的后四位
+- CSV 中的完整 69 码
+- 图片上的条码（由 LLM 识别）
+
+### 2.2 方案调整清单
+
+| 原方案假设               | 实际情况                     | 调整                          |
+|--------------------------|------------------------------|-------------------------------|
+| 文件夹 = 产品            | 文件夹 = 产品组（多 SKU）    | 新增 product_groups 表        |
+| 文件夹下图片直接属产品   | 分语言/渲染/实拍等子文件夹   | 新增 image_sets 表            |
+| LLM JSONL 一行一个产品   | 需要表达一组变体             | JSONL 支持 products 数组      |
+| 只做 CLIP 和文件名索引   | 多语言重复图浪费空间         | 按 image_set 类型选择性索引   |
+| 69码从文件夹名提取       | 多个后四位或没有             | 结合 CSV 数据反向匹配         |
+| Excel 只导入 4 个字段    | CSV 有长宽高/重量/海关编码   | 充分利用 CSV 字段填充 specs   |
+| 搜索返回产品列表         | 变体过多会刷屏               | 默认按产品组聚合，可展开变体  |
+
+---
+
+## 3. 功能需求
+
+### 3.1 产品数据导入
+
+支持三种数据来源：
+
+**(1) CSV 商品表导入**
+- 读取 `.csv` 文件，列名可映射
+- 关键字段：`sku(必填)`、`平台SKU`、`中文名称`、`英文名称`、`商品净重(g)`、`长(cm)`、`宽(cm)`、`高(cm)`、`英文报关`、`中文报关`、`海关编码`、`开发员`
+- 从名称自动提取：颜色、接口类型（X1/X4/X16/M.2/NVMe）、尺寸长度（2280/2242/50CM/20CM）、PCIe 版本（4.0/5.0/3.0）
+- 长/宽/高/重量/海关编码直接写入 `product_specs`
+- 自动识别产品类别（不硬编码关键词，基于名称模式匹配）
+
+**(2) LLM 产品库导入**
+- 扫描器启动时自动检测根目录下的 `products.jsonl`
+- 读取并合并到 SQLite
+- 支持增量更新（通过文件修改时间判断）
+
+**(3) 文件夹结构导入**
+- 扫描 NAS 目录，自动识别产品根文件夹、image_set 子文件夹
+- 未匹配到 CSV/JSONL 的文件夹标记为"未关联产品组"，仍可被搜索
+
+### 3.2 文件索引（离线扫描）
+
+扫描器只做轻量操作：
+  - 识别产品根文件夹
+  - 识别 image_set 子文件夹（语言/渲染/实拍/亚马逊/停售等）
+  - 记录文件 UNC 路径、所属图片集、修改时间
+  - 从文件夹名提取所有 4 位连续数字，作为候选 69 码后四位
+  - 对主语言集/实拍图做 CLIP 特征提取
+  - 生成缩略图（200px）
+  - 计算 pHash、记录宽高和文件大小
+  - 对产品根文件夹名做分词索引
+
+### 3.3 图片集类型识别
+
+扫描器自动识别以下 folder_name 模式：
+
+| 文件夹名                  | set_type      | language | 扫描优先级 | 索引策略   |
+|---------------------------|---------------|----------|-----------|------------|
+| 中文                      | language      | zh       | 1         | 优先索引   |
+| 英语 / 英文               | language      | en       | 1         | 优先索引   |
+| 西班牙语                  | language      | es       | 1         | 优先索引   |
+| 俄语                      | language      | ru       | 2         | 备选索引   |
+| 韩语                      | language      | ko       | 2         | 备选索引   |
+| 印尼语                    | language      | id       | 2         | 备选索引   |
+| 泰语                      | language      | th       | 2         | 备选索引   |
+| 法文                      | language      | fr       | 2         | 备选索引   |
+| 渲染图                    | render        | -        | 3         | 可选索引   |
+| 实拍图                    | real          | -        | 2         | 建议索引   |
+| 主图                      | primary       | -        | 1         | 优先索引   |
+| 详情                      | detail        | -        | 2         | 建议索引   |
+| 亚马逊                    | amazon        | -        | 3         | 可选索引   |
+| 停售 / 停用 / 暂未售      | discontinued  | -        | 0         | 默认不索引 |
+
+### 3.4 统一搜索框
+
+- 顶部单一输入框，支持文字输入 + 拖入图片
+- 400ms 防抖自动触发，回车立即触发
+- 拖入图片立即触发以图搜图
+
+搜索模式分发：
+  - 仅有图        → 以图搜图
+  - 仅有数字      → 69 码渐进搜索
+  - 仅有文字      → 关键字搜索
+  - 图 + 文字     → 交集搜索
+
+### 3.5 69 码渐进搜索
+
+| 输入长度 | 匹配逻辑                              |
+|----------|---------------------------------------|
+| 1-3 位   | `full_code LIKE '%输入'`（后缀模糊）    |
+| 4 位     | `code_tail = 输入`（精确后四位）        |
+| 5-12 位  | `full_code LIKE '%输入'`（逐步逼近）    |
+| 13 位    | `full_code = 输入`（完整码精确）        |
+
+### 3.6 关键字搜索（优先级）
+
+1. `keyword_index` 表精确命中（文件夹名分词，毫秒级）
+2. `product_keywords` 表命中（产品名/描述/规格/标签）
+3. `product_specs` 规格值匹配
+4. OCR 文本匹配（`images.ocr_text LIKE '%keyword%'`）
+5. 产品名部分匹配
+6. 文件夹名部分匹配
+
+### 3.7 当前 UI 架构与交互设计
+
+> **目的**：此章节记录当前已实现的 UI 架构、每个组件的职责、交互流程、以及设计决策的原因。后续 AI 会话应首先阅读此章节理解 UI 全貌，再修改代码。
+
+#### 3.7.1 整体布局（产品优先双栏）
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ 🔍 产品图片检索                              v0.0.1 📌 ─ ✕│  TitleBar
+├──────────────────────────────────────────────────────────┤
+│ 🔍 [___输入69码/关键词，或拖图片___] [69码]        [×]  │  SearchBar
+├──────────────────────────────────────────────────────────┤
+│ [📥导入] [🔄增量扫描] [🔁重建索引]        就绪      [⚙️] │  Toolbar
+├────────────────────┬─────────────────────────────────────┤
+│  产品列表 (35%)    │  产品工作台 (65%)                    │
+│                    │                                      │
+│ ┌────────────────┐ │ ┌──────────────────────────────────┐│
+│ │[图] 6933910... │ │ │        Product Header            ││
+│ │ 蜻蜓x1 PCIe4.0 │ │ │  6933910412233                   ││
+│ │ 🏷️转接卡       │ │ │  蜻蜓x1 PCIe4.0转M.2转接卡       ││
+│ └────────────────┘ │ │  [📂打开] [📋复制69码] [📐复制规格]││
+│ ┌────────────────┐ │ ├──────────────────────────────────┤│
+│ │[图] 6933910... │ │ │  ┌─ 产品图片（可滚动）──────────┐││
+│ │ 蜻蜓X4 PCIe4.0 │ │ │  │ [大图][大图][大图][大图]    │││
+│ │ 🏷️转接卡       │ │ │  │ [大图][大图][大图]          │││
+│ └────────────────┘ │ │  └──────────────────────────────┘││
+│ ┌────────────────┐ │ │  ┌─ 规格参数 ──────────────────┐││
+│ │[图] HT65PC...  │ │ │  │ 接口: PCIe 4.0 x1 → M.2    │││
+│ │ 水晶头护套 蓝色 │ │ │  │ 长16.5 宽14.5 高3.5 重42g │││
+│ │ 🏷️水晶头       │ │ │  └──────────────────────────────┘││
+│ └────────────────┘ │ │  ┌─ 🤖 AI 工作台（知识库就绪后）─┐││
+│ ...                │ │  │ [生成卖点] [翻译描述] ...    │││
+│                    │ │  └──────────────────────────────┘││
+│ ───────────────────│ │                                      │
+│ 找到 12 个产品      │ │                                      │
+│ [📋 复制全部69码]   │ │                                      │
+├────────────────────┴─────────────────────────────────────┤
+│ ✅ 索引就绪 | 112张图 | 16个产品 | ⬤ 离线               │  StatusBar
+└──────────────────────────────────────────────────────────┘
+```
+
+**分栏比例**：35% 左（420px 默认）/ 65% 右（余量），分隔条可拖拽。
+
+#### 3.7.2 搜索栏（SearchBar）
+
+**文件**：`search_tab.py` → `SearchBar` 类
+
+单个 `QLineEdit` + 模式标签 + 清除按钮。
+
+| 输入类型 | 检测方式 | 模式标签 | 派发目标 |
+|----------|----------|----------|----------|
+| 纯数字（如 `2233`） | `text.isdigit()` | `[69码]` 蓝色 | `database.search_products()` 渐进匹配 |
+| 含文字（如 `蜻蜓`） | 非纯数字 | `[关键词]` 绿色 | `database.search_products()` 关键字搜索 |
+| 拖入图片 | 后续实现 | `[以图搜图]` 紫色 | CLIP + FAISS |
+| 图片 + 文字 | 后续实现 | `[交集]` 橙色 | FAISS ∩ 文字结果 |
+
+**防抖**：400ms（`QTimer.singleShot`），回车立即触发。
+
+**为什么不做分类/排序下拉**：卖家最常用的操作是输入 69 码直接定位产品。分类筛选会增加操作步骤，且当前产品数（1405）不足以需要分类过滤。搜索结果的匹配度排序已经足够。
+
+#### 3.7.3 左侧：产品卡片列表（ProductList）
+
+**文件**：`search_tab.py` → `ProductCard` 类 + `ProductList` 类
+
+每个搜索结果 = **一个产品 SKU**，不是文件夹、不是产品组。
+
+**卡片结构**：
+```
+┌──────────────────────────────────┐
+│ ┌────────┐                       │
+│ │ 主图   │  6933910412233   📋  │  69码（蓝色加粗14px，点击复制）
+│ │ 120x120│  蜻蜓x1 PCIe4.0转M.2  │  产品名（白色12px，最多2行）
+│ │ 占位图 │  🏷️ 转接卡            │  分类标签（自动从名称提取）
+│ └────────┘                       │
+└──────────────────────────────────┘
+```
+
+**交互**：
+| 操作 | 行为 |
+|------|------|
+| 左键单击 | 选中（蓝色左边框），右侧加载该产品工作台 |
+| 左键双击 | 打开该产品关联的文件夹 |
+| 点击 69 码 / 📋 | 复制到剪贴板 + toast 提示 |
+| 右键 | 菜单：复制69码 / 打开文件夹 |
+| ↑↓ 键 | 键盘导航 |
+
+**自动提取分类**：`_extract_category(name)` 根据产品名中是否含"转接卡/延长线/硬盘盒/..."等 20+ 关键词自动标注。分类用于卡片上的彩色标签。
+
+**排序**：有关联产品的优先，同产品组的变体相邻排列。
+
+**为什么以产品 SKU 为单位（不是产品组）**：
+- 卖家的最小操作单元是 SKU（一个 69 码 = 一个可售卖的商品）
+- 产品组（文件夹）是图片存储概念，不是业务概念
+- 同一个文件夹下的颜色变体是不同 SKU，需要独立展示
+
+#### 3.7.4 右侧：产品工作台（设计目标与架构）
+
+**设计原则**：
+1. **产品即工作台**：右侧不是被动图片浏览器，而是围绕一个产品的业务操作中心
+2. **卡片式可扩展**：每个功能区块是独立的卡片（card），可折叠、可增删
+3. **为知识库预留**：AI 功能卡片在知识库就绪后激活，不影响现有布局
+4. **信息分层**：最常用的（图片、69码、规格）在上面，辅助功能在下面
+
+**卡片架构（从上到下）**：
+
+| 序号 | 卡片 | 功能 | 状态 |
+|------|------|------|------|
+| ① | **产品身份条** | 69码 + 名称 + 分类 + 操作按钮（固定，不滚动） | ✅ 已实现 |
+| ② | **产品图片** | 按 image_set 分组展示缩略图网格，角标标注来源 | ✅ 已实现 |
+| ③ | **规格参数** | 从 CSV/product_specs 读取的关键规格（可折叠） | ✅ 框架就绪 |
+| ④ | **AI 工作台** | 基于知识库的智能功能（生成描述/翻译/卖点提取） | 🔮 阶段 7 |
+| ⑤ | **关联信息** | 同组变体、所在文件夹、相似产品 | 🔮 阶段 7 |
+
+**业务终极形态**（知识库就绪后）：
+```
+选中一个产品 → 右侧显示：
+  ├─ 产品身份 + 快速复制
+  ├─ 所有产品图片（按语言/用途分组）
+  ├─ 规格参数（CSV + LLM 补充）
+  ├─ 🤖 AI 工作台
+  │   ├─ [生成英文描述] → 一键生成亚马逊 listing
+  │   ├─ [提取卖点]     → 自动提取产品卖点
+  │   ├─ [翻译为西语]   → 多语言市场支持
+  │   ├─ [生成标题]     → 电商平台标题优化
+  │   └─ [客服回复]     → 选中截图 + 产品信息 → AI 回复客户问题
+  └─ 关联产品推荐
+```
+
+#### 3.7.5 交互流程
+
+```
+用户输入 "2233" (400ms 防抖)
+  → SearchBar.search_triggered
+    → SearchTab._on_search("2233")
+      → db.search_products("2233")
+        → 返回 [{"full_code":"6933910412233", "name":"蜻蜓x1...", ...}]
+      → 为每个结果补充 category（_extract_category）和 main_image_path
+      → product_list.set_products(results)
+        → 渲染 ProductCard × N
+        → 自动选中第一个 → 触发右侧加载
+
+用户点击产品卡片
+  → ProductCard.clicked(product_dict)
+    → ProductList._on_card_clicked
+      → 取消其他卡片选中态
+      → 高亮当前卡片（蓝色左边框）
+      → product_selected.emit(product)
+        → SearchTab._on_product_selected(product)
+          → gallery.load_images(images, nas_root)   — 加载图片网格
+          → info_bar.set_product(product, nas_root)  — 更新身份条
+          → specs_panel.set_product(product)         — 更新规格
+
+用户点击 "📂 打开文件夹"
+  → ProductInfoBar._on_open_folder
+    → open_folder.emit(folder_path)
+      → SearchTab._open_folder(path)
+        → _safe_open_folder(path, nas_root)
+          → _resolve_path → os.path.isdir → os.startfile
+
+用户点击 69 码
+  → 复制到剪贴板 → QToolTip 显示 "已复制 6933910412233"
+```
+
+#### 3.7.6 路径解析机制
+
+**关键函数**（`search_tab.py` 顶部）：
+```python
+_resolve_path(relative, nas_root)   # 相对路径拼接 NAS 根目录
+_safe_open_folder(path, nas_root)   # 安全打开文件夹（拼接→检查→startfile）
+_safe_open_file(path, nas_root)     # 安全打开文件
+```
+
+**为什么需要这些函数**：
+- 数据库存的是相对路径（如 `2.转接卡/蜻蜓系列/中文/01.jpg`）
+- NAS 根目录在配置中（如 `K:\1.图片`）
+- 打开文件夹/文件时必须拼接完整路径
+- 早期 Bug：多处 `os.startfile` 直接用相对路径，导致"打开文件夹无效"
+
+**路径拼接规则**：
+- 已是绝对路径 → 直接返回
+- 相对路径 + NAS 根目录已配 → `os.path.join(nas_root, relative)`
+- 相对路径 + NAS 根目录未配 → 返回相对路径（调用方检查存在性）
+
+### 3.8 扫描时扩展建设
+
+扫描遍历是成本最高的一趟操作。以下数据在扫描时"顺便"提取：
+
+| 扩展项 | 说明 | 存储 |
+|--------|------|------|
+| 文件夹名分词索引 | jieba 中文分词 + 空格切分英文 | `keyword_index` |
+| 感知哈希 (pHash) | 64 位 pHash，用于去重 + "找相似图" | `images.phash` |
+| 图片尺寸统计 | 宽、高、文件大小 | `images.width/height/file_size` |
+| 错误日志 | 损坏/不支持的文件记录 | `data/scan_errors.log` |
+| 文件夹变化追踪 | 每次扫描的增/删/改 | `scan_log` |
+
+### 3.9 OCR 文字提取
+
+- 使用 PaddleOCR 对每张图片提取文字
+- 文字存入 `images.ocr_text`，支持后续关键字搜索
+- 断点续扫：通过 `images.ocr_extracted` 标志位实现
+- 增量扫描时仅对新图片执行 OCR
+- 支持 80+ 语言（中/英/马来/泰/俄/韩/日 等）
+
+### 3.10 AI 助手模块
+- **形态**：独立标签页 `🤖 AI 助手`，与 `📦 图片检索` 并列。
+- **功能**：
+  - 全局快捷键触发截屏（全屏或区域），默认 `Ctrl+Shift+Z`，可配置。
+  - PaddleOCR 提取屏幕文字。
+  - 用户输入指令（如"帮我回复"、"总结要点"），连同 OCR 文字发送至 DeepSeek API。
+  - 返回结果自动复制到剪贴板，并展示在助手面板中。
+- **隐私**：截图仅在本地 OCR 处理，仅文本片段上传 API。
+- **网络依赖**：AI 助手需要 DeepSeek API 连接，为核心检索之外的可选功能。
+
+---
+
+## 4. 数据设计
+
+### 4.1 设计原则
+- 产品组 `product_group` 是核心聚合单元
+- 一个产品根文件夹 = 一个 `product_group`
+- 一个 `product_group` 下可含多个 `products`（SKU 变体）
+- 一个 `product_group` 下可含多个 `image_sets`（语言/用途子文件夹）
+- 一个 `image_set` 下含多个 `images`
+- 一个 `product` 可通过 `product_images` 关联多张图片
+- JSONL 是产品库源文件，SQLite 是运行时编译产物
+
+### 4.2 SQLite 表结构
+
+#### 4.2.1 产品组表 `product_groups`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| group_id      | TEXT    | 主键，产品组唯一标识          |
+| folder_path   | TEXT    | 产品根文件夹完整路径          |
+| folder_name   | TEXT    | 产品根文件夹名                |
+| category      | TEXT    | 一级分类                      |
+| sub_category  | TEXT    | 二级分类                      |
+| status        | TEXT    | active/discontinued/unsold    |
+| notes         | TEXT    | 备注                          |
+| created_at    | TEXT    | 创建时间                      |
+| updated_at    | TEXT    | 最后更新时间                  |
+
+索引：
+  `CREATE INDEX idx_pg_folder ON product_groups(folder_path);`
+  `CREATE INDEX idx_pg_name ON product_groups(folder_name);`
+
+#### 4.2.2 产品表 `products`
+
+| 字段名            | 类型    | 说明                          |
+|-------------------|---------|-------------------------------|
+| product_id        | TEXT    | 主键，SKU 唯一标识            |
+| group_id          | TEXT    | 所属产品组                    |
+| full_code         | TEXT    | 完整 69 码                    |
+| code_tail         | TEXT    | 69 码后四位                   |
+| sku_custom        | TEXT    | 自定义 SKU                    |
+| name              | TEXT    | 产品名称                      |
+| description       | TEXT    | 产品描述                      |
+| category          | TEXT    | 一级分类                      |
+| sub_category      | TEXT    | 二级分类                      |
+| brand             | TEXT    | 品牌                          |
+| model             | TEXT    | 型号                          |
+| main_image_id     | INTEGER | 本地主图 image_id             |
+| main_image_url    | TEXT    | CSV 中的云端主图 URL（备用）  |
+| is_primary        | INTEGER | 1=该组主 SKU                  |
+| data_source       | TEXT    | csv/llm/manual                |
+| data_completeness | INTEGER | 完整度评分 0-100              |
+| match_confidence  | REAL    | 匹配置信度 0-1                |
+| match_method      | TEXT    | exact/specs/manual/unmatched  |
+| created_at        | TEXT    | 创建时间                      |
+| updated_at        | TEXT    | 最后更新时间                  |
+
+索引：
+  `CREATE INDEX idx_prod_group ON products(group_id);`
+  `CREATE INDEX idx_prod_full_code ON products(full_code);`
+  `CREATE INDEX idx_prod_code_tail ON products(code_tail);`
+  `CREATE INDEX idx_prod_sku ON products(sku_custom);`
+
+#### 4.2.3 图片集表 `image_sets`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| id            | INTEGER | 主键                          |
+| group_id      | TEXT    | 所属产品组                    |
+| folder_path   | TEXT    | 子文件夹完整路径              |
+| set_type      | TEXT    | language/render/real/...      |
+| language      | TEXT    | 语言代码（zh/en/es/...）      |
+| is_primary    | INTEGER | 1=主图集                      |
+| scan_priority | INTEGER | 扫描优先级（1=优先索引）      |
+
+索引：
+  `CREATE INDEX idx_is_group ON image_sets(group_id);`
+  `CREATE INDEX idx_is_type ON image_sets(set_type);`
+
+#### 4.2.4 文件表 `images`
+
+| 字段名            | 类型    | 说明                          |
+|-------------------|---------|-------------------------------|
+| id                | INTEGER | 主键，对应 FAISS 向量 ID      |
+| set_id            | INTEGER | 所属 image_set                |
+| full_unc          | TEXT    | 文件完整 UNC 路径             |
+| folder_path       | TEXT    | 所属文件夹路径                |
+| file_name         | TEXT    | 文件名                        |
+| ocr_text          | TEXT    | OCR 提取的文字，可空          |
+| ocr_extracted     | INTEGER | 0=未OCR, 1=已完成             |
+| feature_extracted | INTEGER | 0=未提取, 1=已完成            |
+| thumbnail_path    | TEXT    | 缩略图缓存路径                |
+| phash             | INTEGER | 64 位感知哈希                 |
+| width             | INTEGER | 图片宽度 px                   |
+| height            | INTEGER | 图片高度 px                   |
+| file_size         | INTEGER | 文件大小 bytes                |
+| last_modified     | INTEGER | 文件修改时间戳                |
+
+索引：
+  `CREATE INDEX idx_images_set ON images(set_id);`
+  `CREATE INDEX idx_images_feature ON images(feature_extracted);`
+  `CREATE INDEX idx_images_ocr ON images(ocr_extracted);`
+  `CREATE INDEX idx_images_folder ON images(folder_path);`
+
+#### 4.2.5 产品-图片关联表 `product_images`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| id            | INTEGER | 主键                          |
+| product_id    | TEXT    | 关联 products                 |
+| image_id      | INTEGER | 关联 images                   |
+| is_primary    | INTEGER | 1=该产品主图                  |
+| sort_order    | INTEGER | 排序                          |
+| image_type    | TEXT    | product/package/detail/...    |
+| caption       | TEXT    | 图片说明                      |
+| shared        | INTEGER | 1=多 SKU 共享                 |
+
+#### 4.2.6 产品规格表 `product_specs`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| id            | INTEGER | 主键                          |
+| product_id    | TEXT    | 关联 products                 |
+| spec_group    | TEXT    | 规格分组                      |
+| spec_name     | TEXT    | 规格名                        |
+| spec_value    | TEXT    | 规格值                        |
+| source        | TEXT    | csv/llm/manual                |
+| confidence    | REAL    | 置信度                        |
+
+#### 4.2.7 产品关键词表 `product_keywords`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| keyword       | TEXT    | 关键词                        |
+| product_id    | TEXT    | 关联 products                 |
+| source        | TEXT    | 来源                          |
+| weight        | REAL    | 权重                          |
+
+#### 4.2.8 文件夹码表 `folder_codes`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| id            | INTEGER | 主键                          |
+| folder_path   | TEXT    | 文件夹路径                    |
+| code_tail     | TEXT    | 提取的 4 位数字               |
+
+#### 4.2.9 关键词索引表 `keyword_index`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| keyword       | TEXT    | 分词关键词                    |
+| folder_path   | TEXT    | 包含该词的文件夹路径          |
+| PRIMARY KEY   | (keyword, folder_path) |                   |
+
+#### 4.2.10 扫描日志表 `scan_log`
+
+| 字段名        | 类型    | 说明                          |
+|---------------|---------|-------------------------------|
+| id            | INTEGER | 主键                          |
+| scan_time     | REAL    | 扫描时间戳                    |
+| action        | TEXT    | added/deleted/modified        |
+| file_path     | TEXT    | 文件路径                      |
+| folder_path   | TEXT    | 所属文件夹                    |
+
+### 4.3 CSV 列映射建议
+
+| CSV 列              | 目标表/字段                  |
+|---------------------|------------------------------|
+| sku(必填)           | products.full_code 或 sku_custom |
+| 平台SKU             | products.sku_custom          |
+| 中文名称            | products.name + 规格解析     |
+| 英文名称            | products.description         |
+| 分类ID              | products.category            |
+| 商品净重（g）       | product_specs: 重量          |
+| 长(cm)              | product_specs: 长            |
+| 宽(cm)              | product_specs: 宽            |
+| 高(cm)              | product_specs: 高            |
+| 英文报关            | product_specs: 英文报关      |
+| 中文报关            | product_specs: 中文报关      |
+| 海关编码            | product_specs: 海关编码      |
+| 开发员              | product_specs: 开发员        |
+
+### 4.4 FAISS 向量索引
+- 存储位置：`./data/faiss.index`
+- 格式：`IndexHNSWFlat`，维度 = 512（CLIP ViT-B/32）
+- 向量 ID 与 `images.id` 严格一致
+- 仅对 `scan_priority = 1` 的图片做向量索引
+- 索引元数据存储 `model_name`，加载时校验一致性
+
+### 4.5 特征提取模型抽象层
+
+```python
+class BaseFeatureExtractor(ABC):
+    @property
+    def dim(self) -> int: ...
+    @property
+    def model_name(self) -> str: ...
+
+    @abstractmethod
+    def extract_batch(self, paths: list[str]) -> np.ndarray: ...
+    @abstractmethod
+    def extract_single(self, path: str) -> np.ndarray: ...
+```
+
+内置实现：
+| 实现类 | 维度 | 模型名 | 说明 |
+|--------|------|--------|------|
+| `CLIPExtractor` | 512 | `"clip-ViT-B-32"` | 默认，CPU 平衡 |
+| `CLIPLargeExtractor` | 768 | `"clip-ViT-L-14"` | 精度更高，慢 3x |
+
+配置：`config.json` 字段 `feature_model: "clip-ViT-B-32"`。
+
+### 4.6 模型切换逻辑
+
+换模型 = 旧向量失效 → 提示重建：
+  - `feature_extracted` 全部重置为 0
+  - `faiss.index` 删除重建
+  - 缩略图、pHash、keyword_index、产品数据均不受影响
+
+---
+
+## 5. 产品库与 LLM 前置识别
+
+### 5.1 设计理念
+
+将"AI 重活"和"扫描轻活"解耦：
+  - LLM 图片分析：一次性、有网络、有成本
+  - 扫描器：反复运行、离线、零成本
+  - LLM 输出 `products.jsonl`，扫描器启动时导入 SQLite
+
+### 5.2 products.jsonl 格式
+
+每行一个 JSON 对象，代表一个产品组。
+
+顶层字段：
+
+| 字段            | 类型    | 必填 | 说明                          |
+|-----------------|---------|------|-------------------------------|
+| group_id        | string  | 是   | 产品组唯一标识                |
+| folder_name     | string  | 是   | 产品根文件夹名                |
+| folder_path     | string  |      | 相对路径                      |
+| category        | string  | 是   | 一级分类                      |
+| sub_category    | string  |      | 二级分类                      |
+| status          | string  |      | active/discontinued/unsold    |
+| common_specs    | object  |      | 组内所有变体共享的规格        |
+| products        | array   | 是   | SKU 变体数组                  |
+| image_sets      | array   |      | 图片集定义                    |
+| shared_images   | array   |      | 多 SKU 共享图片               |
+| data_source     | string  |      | llm/manual/csv                |
+| llm_model       | string  |      | LLM 模型名                    |
+| llm_timestamp   | string  |      | ISO 8601 时间                 |
+
+products 数组元素：
+
+| 字段            | 类型    | 说明                          |
+|-----------------|---------|-------------------------------|
+| product_id      | string  | SKU 唯一标识                  |
+| name            | string  | 变体名称                      |
+| full_code       | string  | 完整 69 码                    |
+| code_tail       | string  | 后四位                        |
+| sku_custom      | string  | 自定义 SKU                    |
+| main_image_url  | string  | CSV 中的主图 URL（可选）      |
+| is_primary      | bool    | 是否主 SKU                    |
+| matching_specs  | object  | 用于区分变体的关键规格        |
+| specs           | object  | 该变体独有规格                |
+| tags            | array   | 搜索标签                      |
+
+image_sets 数组元素：
+
+| 字段            | 类型    | 说明                          |
+|-----------------|---------|-------------------------------|
+| path            | string  | 子文件夹相对路径              |
+| set_type        | string  | language/render/real/...      |
+| language        | string  | 语言代码                      |
+| is_primary      | bool    | 是否主图集                    |
+
+### 5.3 完整示例（基于真实 CSV 数据）
+
+**CSV 原始行**：
+```
+sku: 6933910412233
+中文名称: PCIe4.0转M.2转接卡 蜻蜓x1（不挡显卡）型号：P717
+图片URL: http://...6d46eba1...jpg
+商品净重: 42g | 长: 16.5cm | 宽: 14.5cm | 高: 3.5cm
+英文报关: PCIE adapter | 中文报关: PCIE 转接卡
+开发员: JEYI2022
+```
+
+**对应的 JSONL**（含同文件夹下的 X4 版变体）：
+
+```json
+{
+  "group_id": "PG-2233-2240",
+  "folder_name": "PCIe4.0转M.2 蜻蜓系列 2233 2240",
+  "folder_path": "2.转接卡/PCIe4.0转M.2 蜻蜓系列 2233 2240",
+  "category": "转接卡",
+  "sub_category": "PCIe转M.2",
+  "status": "active",
+  "common_specs": {
+    "接口": "PCIe 4.0 → M.2 NVMe",
+    "特性": "不挡显卡"
+  },
+  "products": [
+    {
+      "product_id": "6933910412233",
+      "name": "PCIe4.0转M.2转接卡 蜻蜓x1（不挡显卡）",
+      "full_code": "6933910412233",
+      "code_tail": "2233",
+      "main_image_url": "http://productimage-1251220924.picgz.myqcloud.com/productimage/72372744477477913/0/20260420161219/6d46eba1ba0d3fea3ffb70d5cbfc7d9d.jpg",
+      "is_primary": true,
+      "matching_specs": {"型号": "蜻蜓x1", "版本": "X1"},
+      "specs": {
+        "商品净重": "42g",
+        "长": "16.5cm",
+        "宽": "14.5cm",
+        "高": "3.5cm",
+        "英文报关": "PCIE adapter",
+        "中文报关": "PCIE 转接卡",
+        "开发员": "JEYI2022"
+      },
+      "tags": ["NVMe", "M.2", "PCIe 4.0", "转接卡", "蜻蜓", "X1"]
+    },
+    {
+      "product_id": "6933910412240",
+      "name": "PCIe4.0转M.2转接卡 蜻蜓X4（不挡显卡）",
+      "full_code": "6933910412240",
+      "code_tail": "2240",
+      "main_image_url": "http://productimage-1251220924.picgz.myqcloud.com/productimage/72372744477476979/0/20260420161109/26cf8425ea507262a8babfd28d5b698a.jpg",
+      "is_primary": false,
+      "matching_specs": {"型号": "蜻蜓X4", "版本": "X4"},
+      "specs": {
+        "商品净重": "42g",
+        "长": "16.5cm",
+        "宽": "14.5cm",
+        "高": "3.5cm",
+        "英文报关": "PCIE adapter",
+        "中文报关": "PCIE 转接卡",
+        "开发员": "JEYI2022"
+      },
+      "tags": ["NVMe", "M.2", "PCIe 4.0", "转接卡", "蜻蜓", "X4"]
+    }
+  ],
+  "image_sets": [
+    {"path": "中文", "set_type": "language", "language": "zh", "is_primary": true},
+    {"path": "英语", "set_type": "language", "language": "en"},
+    {"path": "西班牙语", "set_type": "language", "language": "es"},
+    {"path": "渲染图", "set_type": "render"},
+    {"path": "实拍图", "set_type": "real"}
+  ],
+  "shared_images": [],
+  "data_source": "csv+llm",
+  "llm_model": "deepseek-v3",
+  "llm_timestamp": "2026-06-22T00:00:00+08:00"
+}
+```
+
+> **关键映射规则**：
+> - `product_id` = CSV 的 `sku(必填)` 值（69 码或自定义 SKU）
+> - `specs` 对象内的 key 直接使用 CSV 中文列名（`商品净重`、`长`、`宽`、`高`、`英文报关`、`中文报关`、`海关编码`、`开发员`）
+> - `tags` 从产品名和规格中自动提取关键词
+> - `main_image_url` 从 CSV 的 `图片URL` 列导入，用于下载主图缩略图
+> - `common_specs` 存放组内所有变体共享的规格，`matching_specs` 存放区分变体的规格
+> - `code_tail` = `full_code` 后 4 位；自定义 SKU 则为空字符串
+```
+
+### 5.4 LLM 识别提示词关键要求
+
+分析一个产品根文件夹时，LLM 必须：
+  1. 识别文件夹下是否包含多个 SKU 变体
+  2. 提取每个变体的区分规格（颜色、尺寸、版本等）
+  3. 识别所有 image_set 子文件夹的类型和语言
+  4. 判断哪些图片是多个变体共享的
+  5. 输出严格 JSON，符合 products.jsonl 格式
+
+### 5.5 CSV 与 JSONL 的匹配策略
+
+当 LLM JSONL 中某个变体缺少 full_code 时：
+  1. 用 matching_specs 在 CSV 中查找候选
+  2. 匹配规则（按优先级）：
+     - 名称中颜色一致 + 名称中规格一致
+     - matching_specs 中所有字段一致
+     - 部分字段一致（如仅颜色一致）
+  3. 若唯一匹配 → 自动填充 full_code
+  4. 若多个候选 → 按 score 排序，标记置信度 < 1.0
+  5. 若无候选 → 标记 match_method = 'unmatched'
+
+---
+
+## 6. 技术选型
+
+| 模块             | 技术                    | 说明                      |
+|------------------|-------------------------|---------------------------|
+| GUI              | PySide6                 | 窗口、标签页、托盘、热键  |
+| 图像特征提取     | open_clip (ViT-B/32)    | 512 维向量                |
+| 向量搜索         | FAISS (HNSW)            | 内存索引，<5ms            |
+| OCR（图片）      | PaddleOCR               | 离线，80+ 语言            |
+| OCR（截图）      | PaddleOCR（多语言）     | AI 助手用                 |
+| 数据库           | SQLite3                 | 零配置，轻量              |
+| LLM 图片分析     | DeepSeek / GPT-4o       | 输出 products.jsonl       |
+| AI 接口          | DeepSeek API            | OpenAI 兼容               |
+| 中文分词         | jieba                   | 文件夹名/产品名分词       |
+| 感知哈希         | imagehash               | 64 位 pHash，去重用       |
+| 打包             | PyInstaller (--onedir)  | 便携文件夹分发            |
+| 版本控制         | Git                     | 分阶段 tag                |
+
+---
+
+## 7. 分阶段实现路线图（含实施状态 v2.2）
+
+> **当前进度**：阶段 0-3 ✅ 完成 | 阶段 4-5 🔮 待开始 | 阶段 6 🚧 框架就绪
+
+### 已实现功能清单
+- 三标签页（图片检索/知识库/AI助手）、暗色主题、系统托盘
+- CSV完整导入（列映射/图片下载/规格入库）、三数据源独立追踪
+- NAS扫描（多层级69码提取/产品关联）
+- 产品级搜索（69码渐进/关键字）、产品卡片+动态规格面板
+- 独立知识库构建工具（LLM提示词/JSONL导入导出）
+- 产品级数据完整性矩阵（CSV/知识库/扫描三源追踪）
+
+### 阶段 0：项目初始化与基础框架
+**目标**：搭建开发环境，实现空窗口、标签页、系统托盘。
+- [ ] 初始化 Git 仓库，编写 `.gitignore`。
+- [ ] 创建 Python 虚拟环境，安装基础依赖（PySide6）。
+- [ ] 实现主窗口（无边框，400×600，置顶选项）。
+- [ ] 添加两个标签页：`📦 图片检索`、`🤖 AI 助手`。
+- [ ] 系统托盘图标及菜单（显示/退出）。
+- [ ] 打包测试（PyInstaller）。
+- **里程碑 tag**: `v0.0-scaffold`
+
+### 阶段 1：数据模型与 CSV 导入
+**目标**：实现完整的 10 表 SQLite 数据库，导入 CSV 产品数据。
+- [ ] 设计并实现 SQLite 建表脚本（`db/schema.sql`）。
+- [ ] 实现 CSV 导入功能：读取 `店小秘商品管理导出` CSV，写入 `products` + `product_specs` 表。
+- [ ] CSV 列名自动映射（支持中文列名）。
+- [ ] 从产品名称自动提取：颜色、接口类型、尺寸、PCIe 版本。
+- [ ] 自动归类产品（基于名称模式匹配而非硬编码关键词）。
+- [ ] 69 码后四位自动提取（`code_tail`）。
+- [ ] `product_groups` 初始化（基于 CSV 导入的产品预创建分组）。
+- **里程碑 tag**: `v0.1-data-model`
+
+### 阶段 2：文件扫描与图片集识别
+**目标**：遍历 NAS 目录，识别产品根文件夹和 image_set 子文件夹。
+- [ ] 实现文件夹遍历（支持 SMB 映射盘符或 UNC 路径）。
+- [ ] 自动识别产品根文件夹（有子文件夹的目录层级）。
+- [ ] image_set 子文件夹类型和语言自动识别。
+- [ ] 写入 `product_groups` + `image_sets` + `images` 表。
+- [ ] 从文件夹名提取所有 4 位连续数字 → `folder_codes`。
+- [ ] 构建 `keyword_index`（jieba 中文分词 + 空格切分英文）。
+- [ ] 扫描错误日志（损坏/不支持的图片 → `data/scan_errors.log`）。
+- **里程碑 tag**: `v0.2-folder-scan`
+
+### 阶段 3：69 码与关键字搜索
+**目标**：实现 SearchDispatcher，完成文本搜索和产品组聚合视图。
+- [ ] 构建 `SearchDispatcher`：判断输入类型（数字/文字/图）。
+- [ ] 69 码渐进搜索（1-3/4/5-12/13 位四种策略）。
+- [ ] 关键字搜索（keyword_index → product_keywords → product_specs → 产品名 → 文件夹名）。
+- [ ] 产品组聚合视图（左侧产品组列表，点击展开变体）。
+- [ ] 右侧缩略图网格（从 NAS 直接加载并缓存缩略图）。
+- [ ] 双击图片打开原文件。
+- [ ] 列表底部 "📋 复制全部69码" 按钮。
+- [ ] 路径条显示和复制。
+- **里程碑 tag**: `v0.3-text-search`
+
+### 阶段 4：以图搜图
+**目标**：打通 CLIP 特征提取与 FAISS 索引，支持以图搜图和交集搜索。
+- [ ] 安装 `open_clip`（含 `torch`）、`faiss-cpu`、`imagehash`。
+- [ ] 实现 `BaseFeatureExtractor` 抽象基类 + `CLIPExtractor`（ViT-B/32）。
+- [ ] FAISS HNSW 索引管理（创建、加载、增量写入、元数据校验）。
+- [ ] 断点续扫（通过 `feature_extracted` 标志位，每 100 张 commit）。
+- [ ] 缩略图生成（200px 宽度，`thumbnails/{md5}.jpg`）。
+- [ ] pHash 计算 + 宽高/文件大小记录。
+- [ ] 拖入图片 → 以图搜图（CLIP 提取 → FAISS 检索）。
+- [ ] 交集搜索（图 + 文字 → FAISS 结果 ∩ 文字搜索结果）。
+- [ ] 结果按相似度排序，显示 `[相似度 XX%]`。
+- [ ] "继续扫描"按钮（`feature_extracted=0` 时显示）+ 进度条。
+- [ ] `config.json` 支持 `feature_model` 配置和模型切换警告。
+- **里程碑 tag**: `v0.4-image-search`
+
+### 阶段 5：OCR 文字提取与搜索融合
+**目标**：为图片提取文字，增强关键字搜索覆盖范围。
+- [ ] 集成 PaddleOCR，编写 `OCRManager`。
+- [ ] `images` 表 `ocr_extracted` 标志位断点续扫。
+- [ ] 增量扫描时对新图片执行 OCR。
+- [ ] 关键字搜索融合 OCR 匹配（`WHERE ocr_text LIKE '%keyword%'`）。
+- [ ] OCR 结果在搜索中的优先级：低于 keyword_index 和 product_keywords，高于文件夹名部分匹配。
+- [ ] 复用阶段 4 的扫描进度组件。
+- **里程碑 tag**: `v0.5-ocr`
+
+### 阶段 6：AI 助手标签页
+**目标**：实现快捷键截图 → OCR → DeepSeek API 生成回复。
+- [ ] 全局热键监听（默认 `Ctrl+Shift+Z`，`config.json` 可配置）。
+- [ ] 截图功能（全屏/区域可选）。
+- [ ] 截图后自动切换至 AI 助手标签页，显示缩略图。
+- [ ] 对截图执行 OCR，提取文字。
+- [ ] 指令输入框和发送按钮。
+- [ ] DeepSeek API 集成（发送 OCR 文字 + 用户指令）。
+- [ ] 显示返回结果，自动复制到剪贴板。
+- [ ] 配置界面（API Key、模型选择、语言选择、快捷键修改）。
+- **里程碑 tag**: `v0.6-ai-assistant`
+
+### 阶段 7：LLM 产品分析脚本
+**目标**：实现独立 LLM 分析脚本，输出 products.jsonl 并导入 SQLite。
+- [ ] 独立脚本 `llm_product_analyzer.py`。
+- [ ] 多图输入 → AI 分析 → 输出 products.jsonl（符合第 5 章格式）。
+- [ ] 支持产品组识别 + 多 SKU 变体。
+- [ ] 支持识别 image_set 类型和语言。
+- [ ] 支持判断共享图片。
+- [ ] JSONL 导入功能（启动时自动检测，增量合并到 SQLite）。
+- [ ] CSV 与 JSONL 匹配策略实现。
+- **里程碑 tag**: `v0.7-llm-analyzer`
+
+### 阶段 8：产品编辑面板与数据完善
+**目标**：提供 GUI 编辑产品组和变体信息，完善数据质量。
+- [ ] 产品组编辑（名称、分类、状态、备注）。
+- [ ] 变体编辑（名称、69 码、规格、标签）。
+- [ ] 主图更换、图片标注（`product_images` 管理）。
+- [ ] 数据完整度评分可视化。
+- [ ] 编辑结果同步回 `products.jsonl`。
+- **里程碑 tag**: `v0.8-product-editor`
+
+### 阶段 9：打磨与打包
+**目标**：提升稳定性、体验，完成分发。
+- [ ] 错误处理与日志记录。
+- [ ] 暗色主题、UI 细节调整。
+- [ ] 全功能集成测试。
+- [ ] 编写用户说明。
+- [ ] PyInstaller `--onedir` 打包，zip 压缩分发。
+- **里程碑 tag**: `v1.0-release`
+
+---
+
+## 8. 版本控制与回退策略
+
+### 8.1 Git 工作流
+- **主分支**：`main`（保护分支，只接受合并请求）。
+- **开发分支**：`dev`（日常开发）。
+- **功能分支**：`feature/xxx`（每个阶段独立分支开发，完成后合并到 `dev`）。
+- **标签**：每完成一个阶段里程碑，在 `dev` 合并到 `main` 后打 tag。
+
+### 8.2 回退方法
+```bash
+git checkout v0.3-text-search -b hotfix/xxx   # 回到阶段 3
+git checkout v0.4-image-search -b hotfix/xxx  # 回到阶段 4
+```
+
+### 8.3 数据兼容性
+- 每阶段数据库结构可能微调，需编写迁移脚本。
+- `products.jsonl` 是纯文本，可纳入 Git，可手动编辑。
+- SQLite 可随时从 JSONL + CSV 重建。
+
+---
+
+## 9. 可扩展接口设计
+
+### 9.1 搜索结果产品卡片格式化
+
+左侧产品卡片由以下方法渲染：
+
+| 方法 | 职责 | 扩展方向 |
+|------|------|----------|
+| `_build_product_card(product_id)` | 构建完整产品卡片 widget（缩略图 + 69码 + 名称 + 标签） | AI 优化产品名显示 |
+| `_fmt_code_label(full_code, sku_custom)` | 格式化 69 码显示（13位加空格分组：`6934 5678 2180`） | 支持条形码字体 |
+| `_fmt_specs_summary(product_id)` | 从 product_specs 提取 1-2 个关键规格做摘要显示 | 按分类定制关键规格 |
+| `_fmt_category_tag(category)` | 生成彩色分类标签 | 自动配色方案 |
+| `_fmt_similarity_bar(score)` | 相似度蓝色进度条（图搜模式） | 动画过渡效果 |
+
+每个产品卡片的 `QWidget` 存储结构化数据：
+- `UserRole`：`product_id`（供详情加载）
+- `UserRole+1`：`full_code`（供复制操作）
+- `UserRole+2`：`group_id`（供查找同组变体）
+
+### 9.2 69 码复制
+- 点击变体 → 复制该变体 69 码
+- 点击产品组 → 复制该组所有 69 码
+- 列表底部 "📋 复制全部69码" → 复制当前搜索结果所有 69 码
+
+### 9.3 特征提取模型抽象
+- `BaseFeatureExtractor` 抽象基类
+- 内置 `CLIPExtractor`（512 维）和 `CLIPLargeExtractor`（768 维）
+- `config.json` 配置 `feature_model`
+
+---
+
+## 附录 A：典型目录结构示例
+
+```
+2.转接卡/
+└── 10.型号：冷雨燕 黑 型号：冷雨燕 红 2180 1961/
+    ├── 中文/
+    ├── 英语/
+    ├── 西班牙语/
+    ├── 俄语/
+    ├── 韩语/
+    ├── 渲染图/
+    └── 实拍图/
+
+13.PCIE延长线/
+└── 1. PCIE X1 4.0 3.0 （180-90度） 0566/
+    ├── 亚马逊/
+    ├── 俄语/
+    ├── 印尼语/
+    ├── 实拍图/
+    ├── 渲染图/
+    ├── 英语/
+    ├── 西班牙语/
+    └── 韩语/
+```
+
+## 附录 B：后续迭代预留
+
+### B.1 组合商品支持
+`mock-data/店小秘组合商品导出20260512.csv` 包含 504 个组合 SKU（如延长线+支架套装）。当前版本暂不纳入，后续可通过以下方式支持：
+- 新增 `combo_products` 表
+- 组合 SKU 作为一种特殊的 `product_group`（其 `products` 数组中子 SKU 来自不同文件夹）
+- 导入时自动展开组合，生成虚拟产品组
+
+### B.2 更多 LLM 模型支持
+- 多模态模型（GPT-4V / Claude Vision）直接分析产品图片输出规格
+- 本地小模型（如 Qwen-VL）替代云端 LLM 降低成本
+
+---
+
+## 附录 C：产品规格动态表（v2.1 新增）
+
+### C.1 设计原则
+
+规格不应硬编码。不同类别的产品有不同的规格维度：
+
+| 产品类别 | 关心的规格 |
+|----------|-----------|
+| 转接卡 | 接口版本(PCIe 4.0/5.0)、设备接口(M.2/NVMe/SATA)、支持尺寸(2280/2242) |
+| 延长线 | 线长(25CM/50CM)、接口版本、方向(左进左出)、颜色 |
+| 硬盘盒 | 硬盘尺寸(2.5寸/3.5寸)、盘位(单盘/双盘)、RAID、传输速度 |
+| 散热片 | 颜色、材质、兼容尺寸 |
+| 水晶头/护套 | 颜色、类别(六类/超五类)、包装数量 |
+
+这些维度无法在编码时穷举。**应该在 CSV 导入和知识库导入时动态填充。**
+
+### C.2 product_specs 表
+
+```sql
+CREATE TABLE product_specs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id  INTEGER NOT NULL,
+    spec_group  TEXT    NOT NULL DEFAULT '',   -- 分组：物理参数/接口/报关信息/基本规格
+    spec_name   TEXT    NOT NULL,              -- 规格名：长/宽/高/接口版本/颜色/...
+    spec_value  TEXT    NOT NULL DEFAULT '',   -- 规格值
+    source      TEXT    NOT NULL DEFAULT 'csv', -- csv / llm / auto / manual
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+```
+
+### C.3 规格数据来源
+
+| 来源 | 标记 | 触发时机 | 示例 |
+|------|------|----------|------|
+| CSV 导入 | `csv` | 导入产品 CSV 时，自动识别规格列 | 长/宽/高/重量/海关编码/开发员 |
+| 名称自动提取 | `auto` | 搜索/展示时实时提取 | PCIe版本、颜色、线长 |
+| LLM 知识库 | `llm` | 导入 products.jsonl 时 | 接口类型、支持尺寸、特性 |
+| 手动编辑 | `manual` | 产品编辑面板（阶段 8） | 人工修正/补充 |
+
+### C.4 CSV 列自动映射
+
+导入 CSV 时，系统自动识别以下列名并映射到规格：
+
+| CSV 列（模糊匹配） | spec_name | spec_group |
+|-------------------|-----------|------------|
+| 长(cm) / 长 / length | 长 | 物理参数 |
+| 宽(cm) / 宽 / width | 宽 | 物理参数 |
+| 高(cm) / 高 / height | 高 | 物理参数 |
+| 商品净重 / 重量 / weight | 商品净重 | 物理参数 |
+| 英文报关 / english_declare | 英文报关 | 报关信息 |
+| 中文报关 / chinese_declare | 中文报关 | 报关信息 |
+| 海关编码 / hs_code | 海关编码 | 报关信息 |
+| 开发员 / developer | 开发员 | 其他 |
+
+---
+
+## 附录 D：独立知识库构建工具（v2.1 新增）
+
+### D.1 设计理念
+
+知识库构建与主应用**完全解耦**：
+
+```
+[build_knowledge_base.py]          ← 独立工具
+  ├── 扫描 NAS 目录结构
+  ├── 生成 LLM 提示词
+  └── 输出 products.jsonl
+
+[主应用 — 导入知识库]               ← 读取 JSONL 合并到 SQLite
+  ├── 工具条 → "🧠 导入知识库"
+  ├── 选择 .jsonl 文件
+  └── 解析 → 更新 products + product_specs
+```
+
+**为什么解耦：**
+- LLM 分析需要网络 + API Key + 费用，不适合嵌入离线优先的桌面工具
+- JSONL 是纯文本，可版本控制、可手动编辑、可跨项目复用
+- 不同 NAS 目录可用同一个知识库工具，只改输入路径
+
+### D.2 使用流程
+
+```bash
+# 步骤 1：生成提示词
+python build_knowledge_base.py --input K:\1.图片 --prompt-only
+
+# 步骤 2：复制提示词发给 LLM（DeepSeek/GPT-4o），获得 JSONL 回复
+
+# 步骤 3：保存为 products.jsonl
+
+# 步骤 4：在主应用中导入
+#   工具条 → 🧠 导入知识库 → 选择 products.jsonl
+```
+
+### D.3 LLM 提示词模板（核心）
+
+提示词位于 `build_knowledge_base.py` → `build_prompt()` 函数。关键内容：
+
+1. **识别产品根文件夹**：包含子文件夹的目录
+2. **识别 SKU 变体**：从文件夹名提取 69 码后四位、型号、颜色、规格
+3. **识别图片集**：子文件夹名 → set_type + language 映射表
+4. **提取规格**：从文件夹名推断接口/尺寸/版本
+5. **生成唯一 ID**：优先用 69 码，其次 SKU，最后 group_id + 序号
+
+详细规范 → 见 `PRODUCT_JSONL_SCHEMA` 常量。
+
+### D.4 JSONL 导入数据流
+
+```
+products.jsonl 每行 = 一个 product_group
+  │
+  ├── products[] → INSERT/UPDATE products 表
+  │     ├── full_code → products.full_code (UNIQUE)
+  │     ├── name → products.name
+  │     ├── main_image_url → products.main_image_url
+  │     └── code_tail = full_code[-4:]
+  │
+  ├── common_specs{} → INSERT product_specs (group级，所有变体共享)
+  │     └── spec_name=接口, spec_value=PCIe 4.0 x1, source='llm'
+  │
+  └── products[].specs{} → INSERT product_specs (变体独有)
+        └── spec_name=颜色, spec_value=黑色, source='llm'
+```
+
+### D.5 主图获取优先级
+
+```
+1. CSV 导入时下载的本地缓存 (products.main_image_local)
+2. NAS 扫描的关联图片 (images.full_unc)
+3. CSV 原始 URL (仅作标记，不下载时不使用)
+```
+
+---
+
+## 附录 E：确认的修正数据
+
+| 字段 | 修正值 | 依据 |
+|------|--------|------|
+| 69 码产品数 | **1225** | CSV 逐行统计（非 1229） |
+| 自定义 SKU 数 | **180** | CSV 逐行统计（非 176） |
+| 产品分类 | **20+ 个类别** | CSV 关键词分析（非 6 个） |
+| 组合商品 CSV | **504 个组合 SKU** | 暂不纳入，后续迭代 |
+
+---
+
+---
+
+## 附录 F：知识库管理标签页（v2.2）
+
+### F.1 设计目标
+
+在图片检索和 AI 助手之间插入独立的知识库管理页，解决：
+1. **产品级数据来源追踪**：每个产品有哪些信息，各来自哪个数据源
+2. **知识库导入/导出**：JSONL 文件的完整生命周期管理
+3. **提示词一键复制**：生成完整 LLM 提示词（含当前 NAS 目录结构），粘贴给 AI 即可
+4. **三数据源独立清除**：CSV / LLM / 扫描各自独立删，互不影响
+
+### F.2 界面布局
+
+```
+🧠 知识库                                    [🔄 刷新]
+
+┌─ 数据总览 ───────────────────────────────────────┐
+│ 📦 16个产品 │ 📥 CSV:12个(32条) │ 🧠 KB:3个(17条) │ 📷 扫描:10个有图(112张) │
+└──────────────────────────────────────────────────┘
+
+┌─ 产品数据来源明细 ───────────────────────────────┐
+│ 产品码          │ 产品名称    │ CSV │ KB │ 图片 │ 完整度 │
+│ 6933910412233   │ 蜻蜓x1...  │  2  │  5 │  14 │  ●    │
+│ HT65PCBU001     │ 水晶头...  │  1  │  — │   0 │  ◐    │
+└──────────────────────────────────────────────────┘
+
+[📥 导入JSONL] [📤 导出JSONL]  [📋 复制LLM提示词]  [清CSV][清KB][清扫描]
+```
+
+### F.3 数据完整性矩阵
+
+`get_product_source_matrix()` 返回每个产品的三源数据统计：
+
+| 字段 | 含义 | 来源 |
+|------|------|------|
+| csv_specs | CSV导入的规格数 | CSV列映射 |
+| auto_specs | 从名称自动提取的规格数 | `_extract_specs_from_name()` |
+| llm_specs | 知识库(JSONL)规格数 | products.jsonl |
+| image_count | 关联的扫描图片数 | NAS扫描+product_folder_link |
+
+完整度评分：● 三源完整 / ◑ 两个来源 / ◐ 单一来源 / ○ 无数据
+
+### F.4 知识库生命周期
+
+```
+生成                  导入                  查询
+build_knowledge_base  knowledge_tab         search_tab
+  │                    │                     │
+  ├→ 扫描目录结构       ├→ 选择JSONL文件       ├→ search_products()
+  ├→ 生成LLM提示词      ├→ import_jsonl()      ├→ get_product_specs()
+  ├→ 用户复制给AI       ├→ 更新products表      └→ SpecsCard渲染
+  ├→ AI返回JSONL        ├→ 更新product_specs
+  └→ 保存为文件         └→ data_source='llm'
+```
+
+---
+
+此文档综合了 v1.0 原始需求、v2.1 开发蓝图、以及基于 mock-data 的多轮验证修正，作为后续编码实现的唯一参考。在实际编码时，可按阶段逐一实现并验证。

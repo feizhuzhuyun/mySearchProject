@@ -530,6 +530,310 @@ QLabel[sectionHeader="yes"] {
     font-weight: 600;
     padding: 0;
 }
+
+/* === 搜索栏 v2.0 === */
+#searchBar {
+    background-color: $bg_surface;
+    border-bottom: 1px solid $border_default;
+}
+#searchInput {
+    background-color: $bg_input;
+    border: 2px solid $bg_button;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 13px;
+}
+#searchInput:focus {
+    border-color: $accent;
+    background-color: $bg_input_focus;
+}
+#clearBtn {
+    background: transparent;
+    border: none;
+    color: $text_subtle;
+    font-size: 16px;
+    font-weight: bold;
+    border-radius: 14px;
+}
+#clearBtn:hover {
+    background: $bg_button;
+    color: $text_primary;
+}
+
+/* === 产品卡片列表 v2.0 === */
+#productCardList {
+    background-color: $bg_deepest;
+    border: none;
+    outline: none;
+    padding: 4px;
+}
+#productCardList::item {
+    border: none;
+    padding: 0;
+}
+#productCard {
+    background-color: $bg_surface;
+    border: 1px solid $border_default;
+    border-radius: 8px;
+    border-left: 3px solid transparent;
+}
+#productCard:hover {
+    background-color: $bg_input;
+}
+#productCard[selected="true"] {
+    background-color: $bg_input;
+    border-left: 3px solid $accent;
+}
+#cardThumb {
+    background-color: $bg_deepest;
+    border: 1px solid $border_default;
+    border-radius: 6px;
+}
+#cardCode {
+    color: $accent;
+    font-size: 14px;
+    font-weight: bold;
+}
+#cardCopyBtn {
+    background: transparent;
+    border: none;
+    font-size: 13px;
+    border-radius: 3px;
+    padding: 0;
+}
+#cardCopyBtn:hover {
+    background: $bg_button;
+}
+#cardName {
+    color: $text_primary;
+    font-size: 12px;
+}
+#cardTag {
+    color: $accent_hover;
+    font-size: 10px;
+    font-weight: 600;
+}
+#cardSpecs {
+    color: $text_subtle;
+    font-size: 10px;
+}
+
+/* === 列表底部栏 === */
+#listFooter {
+    background-color: $bg_surface;
+    border-top: 1px solid $border_default;
+}
+#listCount {
+    color: $text_subtle;
+    font-size: 11px;
+}
+#copyAllBtn {
+    background: $bg_input;
+    border: 1px solid $bg_button;
+    border-radius: 5px;
+    padding: 3px 10px;
+    font-size: 11px;
+    color: $text_secondary;
+}
+#copyAllBtn:hover {
+    background: $bg_button;
+    color: $text_primary;
+}
+
+/* === 右侧面板 === */
+#rightPanel {
+    background-color: $bg_deepest;
+}
+
+/* === 图片浏览 === */
+#imageGallery {
+    background-color: $bg_deepest;
+    border: none;
+}
+#galleryItem {
+    background: transparent;
+}
+#galleryThumb {
+    border: 1px solid $border_default;
+    border-radius: 6px;
+    background-color: $bg_surface;
+}
+#galleryThumb:hover {
+    border-color: $accent;
+}
+#galleryBadge {
+    background: rgba(0, 0, 0, 0.7);
+    color: $text_primary;
+    font-size: 9px;
+    font-weight: 600;
+    border-radius: 3px;
+    padding: 1px 6px;
+}
+#galleryFileName {
+    color: $text_subtle;
+    font-size: 10px;
+}
+
+/* === 产品信息栏 === */
+#productInfoBar {
+    background-color: $bg_surface;
+    border-top: 1px solid $border_default;
+    border-bottom: 1px solid $border_default;
+}
+#infoCode {
+    color: $accent;
+    font-size: 14px;
+    font-weight: bold;
+}
+#infoName {
+    color: $text_primary;
+    font-size: 13px;
+}
+#infoTag {
+    color: $accent_hover;
+    font-size: 10px;
+    font-weight: 600;
+}
+#infoPath {
+    color: $text_subtle;
+    font-size: 11px;
+}
+#infoSep {
+    color: $border_default;
+    font-weight: bold;
+}
+#infoBtn {
+    background: $bg_input;
+    border: 1px solid $bg_button;
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 11px;
+    color: $text_secondary;
+}
+#infoBtn:hover {
+    background: $bg_button;
+    color: $text_primary;
+}
+
+/* === 规格面板（旧，保留兼容）=== */
+#specsPanel {
+    background-color: $bg_surface;
+}
+#specsSummary {
+    color: $text_subtle;
+    font-size: 11px;
+}
+#specsToggle {
+    background: transparent;
+    border: none;
+    color: $text_subtle;
+    font-size: 10px;
+    padding: 0;
+}
+#specsToggle:hover {
+    color: $accent;
+}
+
+/* === 右侧滚动区域 === */
+#rightScroll {
+    background-color: $bg_deepest;
+    border: none;
+}
+#scrollContent {
+    background-color: $bg_deepest;
+}
+
+/* === 卡片通用 === */
+#cardTitle {
+    color: $text_header;
+    font-size: 13px;
+    font-weight: bold;
+}
+#cardCount {
+    color: $text_subtle;
+    font-size: 11px;
+}
+
+/* === ① 产品身份条 === */
+#identityBar {
+    background-color: $bg_surface;
+    border-bottom: 1px solid $border_default;
+}
+#identityCode {
+    color: $accent;
+    font-size: 16px;
+    font-weight: bold;
+}
+#identityName {
+    color: $text_primary;
+    font-size: 14px;
+}
+#identityCat {
+    color: $accent_hover;
+    font-size: 11px;
+    font-weight: 600;
+}
+#identityPath {
+    color: $text_subtle;
+    font-size: 11px;
+}
+#identityBtn {
+    background: $bg_input;
+    border: 1px solid $bg_button;
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 11px;
+    color: $text_secondary;
+}
+#identityBtn:hover {
+    background: $bg_button;
+    color: $text_primary;
+}
+
+/* === ② 产品图片卡片 === */
+#imageCard {
+    background-color: $bg_surface;
+    border: 1px solid $border_default;
+    border-radius: 8px;
+}
+#cardThumb {
+    border: 1px solid $border_default;
+    border-radius: 4px;
+    background-color: $bg_deepest;
+}
+
+/* === ③ 规格卡片 === */
+#specsCard {
+    background-color: $bg_surface;
+    border: 1px solid $border_default;
+    border-radius: 8px;
+}
+#specKey {
+    color: $text_subtle;
+    font-size: 12px;
+}
+#specValue {
+    color: $text_primary;
+    font-size: 12px;
+}
+#specsEmpty {
+    color: $text_subtle;
+    font-size: 12px;
+    padding: 8px 0;
+}
+
+/* === ④ AI 卡片 === */
+#aiCard {
+    background-color: $bg_surface;
+    border: 1px solid $border_default;
+    border-radius: 8px;
+    opacity: 0.7;
+}
+#aiHint {
+    color: $text_subtle;
+    font-size: 11px;
+    line-height: 1.6;
+}
 """)
 
 

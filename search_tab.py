@@ -1,8 +1,22 @@
-"""检索标签页。"""
-import os, time
+"""
+检索标签页 — v2.0 产品优先布局。
+
+左侧：产品卡片列表（69码 + 主图缩略图 + 名称 + 分类标签）
+右侧：图片浏览 + 产品信息 + 可折叠规格
+"""
+import os, re
 from PySide6.QtCore import Qt, QPoint, QSize, QThread, QTimer, Signal
-from PySide6.QtGui import QIcon,QImageReader,QPixmap,QPainter,QColor,QFont,QPen,QBrush
-from PySide6.QtWidgets import (QApplication,QDialog,QFileDialog,QGridLayout,QHBoxLayout,QLabel,QLineEdit,QListWidget,QListWidgetItem,QMessageBox,QPushButton,QScrollArea,QToolTip,QVBoxLayout,QWidget,QSplitter)
+from PySide6.QtGui import (
+    QIcon, QImageReader, QPixmap, QPainter, QColor, QFont, QPen, QBrush,
+    QAction, QCursor,
+)
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QFileDialog, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSplitter, QToolTip,
+    QVBoxLayout, QWidget, QMenu, QFrame,
+)
+
 from config import Config
 from database import Database
 from import_dialog import ImportDialog
@@ -10,15 +24,934 @@ from scanner import ScanWorker, ScanThread
 from widgets import Card, Placeholder
 from settings_dialog import SettingsDialog
 
-try:
-    from models import get_instance as _get_model_instance
-except ImportError:
-    _get_model_instance = None
 
+# ── 常量 ─────────────────────────────────────────────────────────
+THUMB_SIZE = 120          # 产品卡片缩略图
+GALLERY_SIZE = 220        # 右侧图片浏览缩略图
+CARD_HEIGHT = THUMB_SIZE + 16  # 8px padding × 2
+SEARCH_DEBOUNCE_MS = 400
+
+
+def _resolve_path(relative: str, nas_root: str) -> str:
+    """将相对路径拼接 NAS 根目录；已绝对路径则直接返回。"""
+    if not relative:
+        return ""
+    if os.path.isabs(relative):
+        return relative
+    if nas_root:
+        return os.path.join(nas_root, relative)
+    return relative  # 无 nas_root 时保持原样（调用方检查存在性）
+
+
+def _safe_open_folder(path: str, nas_root: str = ""):
+    """安全打开文件夹：拼接路径 → 检查存在 → 打开。"""
+    full = _resolve_path(path, nas_root)
+    if full and os.path.isdir(full):
+        os.startfile(full)
+    elif full and os.path.isfile(full):
+        os.startfile(os.path.dirname(full))
+
+
+def _safe_open_file(path: str, nas_root: str = ""):
+    """安全打开文件：拼接路径 → 检查存在 → 用默认程序打开。"""
+    full = _resolve_path(path, nas_root)
+    if full and os.path.isfile(full):
+        os.startfile(full)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SearchBar — 极简搜索输入框
+# ═══════════════════════════════════════════════════════════════════
+class SearchBar(QWidget):
+    """搜索栏：输入框 + 模式标签 + 清除按钮。"""
+
+    search_triggered = Signal(str)
+    clear_triggered = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("searchBar")
+        self._mode = "idle"  # idle / code / keyword / image / intersect
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+
+        # 模式标签
+        self.mode_tag = QLabel("")
+        self.mode_tag.setObjectName("modeTag")
+        self.mode_tag.setFixedHeight(28)
+        self.mode_tag.setVisible(False)
+        layout.addWidget(self.mode_tag)
+
+        # 搜索图标
+        icon = QLabel("🔍")
+        icon.setFixedWidth(20)
+        icon.setStyleSheet("font-size: 14px;")
+        layout.addWidget(icon)
+
+        # 输入框
+        self.input = QLineEdit()
+        self.input.setObjectName("searchInput")
+        self.input.setPlaceholderText("输入69码/关键词，或拖图片到此处…")
+        self.input.setFixedHeight(40)
+        self.input.setAcceptDrops(True)
+        layout.addWidget(self.input, 1)
+
+        # 清除按钮
+        self.btn_clear = QPushButton("×")
+        self.btn_clear.setObjectName("clearBtn")
+        self.btn_clear.setFixedSize(28, 28)
+        self.btn_clear.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_clear.setToolTip("清空搜索")
+        self.btn_clear.clicked.connect(self._clear)
+        self.btn_clear.setVisible(False)
+        layout.addWidget(self.btn_clear)
+
+        # 防抖定时器
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._timer.timeout.connect(self._emit_search)
+
+        self.input.textChanged.connect(self._on_text_changed)
+        self.input.returnPressed.connect(self._emit_search)
+
+    def _on_text_changed(self, text: str):
+        self.btn_clear.setVisible(bool(text))
+        self._timer.start()
+        # 更新模式标签
+        if not text.strip():
+            self._set_mode("idle")
+        elif text.strip().isdigit():
+            self._set_mode("code")
+        else:
+            self._set_mode("keyword")
+
+    def _emit_search(self):
+        self._timer.stop()
+        self.search_triggered.emit(self.input.text().strip())
+
+    def _clear(self):
+        self.input.clear()
+        self.clear_triggered.emit()
+
+    def _set_mode(self, mode: str):
+        self._mode = mode
+        tag_map = {
+            "idle": ("", ""),
+            "code": ("69码", "#4FC3F7"),
+            "keyword": ("关键词", "#81C784"),
+            "image": ("以图搜图", "#CE93D8"),
+            "intersect": ("交集", "#FFB74D"),
+        }
+        text, color = tag_map.get(mode, ("", ""))
+        if text:
+            self.mode_tag.setText(text)
+            self.mode_tag.setStyleSheet(
+                f"background:{color}22; color:{color}; "
+                f"border:1px solid {color}44; border-radius:4px; "
+                f"padding:2px 8px; font-size:11px; font-weight:bold;"
+            )
+            self.mode_tag.setVisible(True)
+        else:
+            self.mode_tag.setVisible(False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ProductCard — 单张产品卡片
+# ═══════════════════════════════════════════════════════════════════
+class ProductCard(QFrame):
+    """左侧产品卡片 — 缩略图 + 69码 + 名称 + 分类标签。"""
+
+    clicked = Signal(dict)       # 单击 → 选中
+    double_clicked = Signal(str)  # 双击 → 打开文件夹
+
+    def __init__(self, product: dict, nas_root: str = "", parent=None):
+        super().__init__(parent)
+        self._product = product
+        self._nas_root = nas_root
+        self._selected = False
+        self.setObjectName("productCard")
+        self.setFixedHeight(CARD_HEIGHT)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._setup_ui()
+        self._load_thumbnail()
+
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+
+        # ── 左：缩略图 ──
+        self.thumb = QLabel()
+        self.thumb.setFixedSize(THUMB_SIZE, THUMB_SIZE)
+        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb.setObjectName("cardThumb")
+        layout.addWidget(self.thumb)
+
+        # ── 右：文字信息 ──
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+
+        # 69码行
+        code_row = QHBoxLayout()
+        code_row.setSpacing(6)
+        code_label = QLabel(self._product.get("full_code", ""))
+        code_label.setObjectName("cardCode")
+        code_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        code_label.mousePressEvent = lambda e: self._copy_code()
+        code_row.addWidget(code_label)
+
+        btn_copy = QPushButton("📋")
+        btn_copy.setObjectName("cardCopyBtn")
+        btn_copy.setFixedSize(22, 22)
+        btn_copy.setToolTip("复制69码")
+        btn_copy.clicked.connect(self._copy_code)
+        code_row.addWidget(btn_copy)
+        code_row.addStretch()
+        text_box.addLayout(code_row)
+
+        # 产品名
+        name = QLabel(self._product.get("name", ""))
+        name.setObjectName("cardName")
+        name.setWordWrap(True)
+        name.setMaximumHeight(36)
+        text_box.addWidget(name)
+
+        # 分类标签
+        category = self._product.get("category", "")
+        if category:
+            tag = QLabel(f"🏷️ {category}")
+            tag.setObjectName("cardTag")
+            text_box.addWidget(tag)
+
+        # 规格摘要（如有）
+        specs = self._product.get("specs_summary", "")
+        if specs:
+            spec_label = QLabel(specs)
+            spec_label.setObjectName("cardSpecs")
+            text_box.addWidget(spec_label)
+
+        text_box.addStretch()
+        layout.addLayout(text_box, 1)
+
+    def _load_thumbnail(self):
+        """从NAS加载产品主图缩略图。"""
+        image_path = self._product.get("main_image_path", "")
+        if image_path and os.path.isfile(image_path):
+            reader = QImageReader(image_path)
+            reader.setAutoTransform(True)
+            reader.setScaledSize(QSize(THUMB_SIZE, THUMB_SIZE))
+            pix = QPixmap.fromImageReader(reader)
+            if not pix.isNull():
+                self.thumb.setPixmap(pix)
+                return
+        # 占位
+        self.thumb.setText("🖼️")
+        self.thumb.setStyleSheet("font-size: 32px; color: #45475a;")
+
+    def _copy_code(self):
+        code = self._product.get("full_code", "")
+        if code:
+            QApplication.clipboard().setText(code)
+            QToolTip.showText(self.mapToGlobal(QPoint(0, -28)), f"已复制 {code}", self)
+
+    def set_selected(self, selected: bool):
+        self._selected = selected
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._product)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        folder = self._product.get("folder_path", "")
+        if folder:
+            self.double_clicked.emit(_resolve_path(folder, self._nas_root))
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        act_copy = QAction("📋 复制69码")
+        act_copy.triggered.connect(self._copy_code)
+        menu.addAction(act_copy)
+        folder = self._product.get("folder_path", "")
+        if folder:
+            act_open = QAction("📁 打开文件夹")
+            act_open.triggered.connect(
+                lambda f=_resolve_path(folder, self._nas_root): self.double_clicked.emit(f)
+            )
+            menu.addAction(act_open)
+        menu.exec(event.globalPos())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ProductList — 左侧产品卡片列表
+# ═══════════════════════════════════════════════════════════════════
+class ProductList(QWidget):
+    """产品卡片列表 + 底部计数 + 复制全部按钮。"""
+
+    product_selected = Signal(dict)
+    product_double_clicked = Signal(str)
+    count_changed = Signal(int)
+
+    def __init__(self, nas_root: str = "", parent=None):
+        super().__init__(parent)
+        self._nas_root = nas_root
+        self._cards: list[ProductCard] = []
+        self._all_codes: list[str] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 卡片列表
+        self.list_widget = QListWidget()
+        self.list_widget.setObjectName("productCardList")
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_widget.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.list_widget.setSpacing(2)
+        layout.addWidget(self.list_widget, 1)
+
+        # 底部栏
+        footer = QWidget()
+        footer.setObjectName("listFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(12, 6, 12, 6)
+        footer_layout.setSpacing(8)
+
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("listCount")
+        footer_layout.addWidget(self.count_label)
+        footer_layout.addStretch()
+
+        self.btn_copy_all = QPushButton("📋 复制全部69码")
+        self.btn_copy_all.setObjectName("copyAllBtn")
+        self.btn_copy_all.setToolTip("复制当前列表所有69码（换行分隔）")
+        self.btn_copy_all.clicked.connect(self._copy_all)
+        self.btn_copy_all.setVisible(False)
+        footer_layout.addWidget(self.btn_copy_all)
+
+        layout.addWidget(footer)
+
+    def set_products(self, products: list[dict]):
+        """填充产品卡片列表。"""
+        self.list_widget.clear()
+        self._cards.clear()
+        self._all_codes.clear()
+
+        if not products:
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            empty = QLabel("  无匹配结果")
+            empty.setObjectName("cardName")
+            empty.setStyleSheet("padding:20px;")
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, empty)
+            self.count_label.setText("")
+            self.btn_copy_all.setVisible(False)
+            self.count_changed.emit(0)
+            return
+
+        for p in products:
+            card = ProductCard(p, self._nas_root)
+            card.clicked.connect(self._on_card_clicked)
+            card.double_clicked.connect(self._on_card_double_clicked)
+            self._cards.append(card)
+
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, CARD_HEIGHT + 4))
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, card)
+
+        # 选中第一个
+        if self._cards:
+            self._cards[0].set_selected(True)
+            self._selected_card = self._cards[0]
+            self.product_selected.emit(products[0])
+
+        self._all_codes = [p.get("full_code", "") for p in products if p.get("full_code")]
+        self.btn_copy_all.setVisible(len(self._all_codes) > 1)
+        self.count_label.setText(f"找到 {len(products)} 个产品")
+        self.count_changed.emit(len(products))
+
+    def _on_card_clicked(self, product: dict):
+        for c in self._cards:
+            c.set_selected(False)
+        sender = self.sender()
+        if isinstance(sender, ProductCard):
+            sender.set_selected(True)
+            self._selected_card = sender
+        self.product_selected.emit(product)
+
+    def _on_card_double_clicked(self, path: str):
+        self.product_double_clicked.emit(path)
+
+    def _copy_all(self):
+        if self._all_codes:
+            QApplication.clipboard().setText("\n".join(self._all_codes))
+            self.count_label.setText(f"已复制 {len(self._all_codes)} 个69码")
+            QTimer.singleShot(2000, lambda: self.count_label.setText(
+                f"找到 {len(self._cards)} 个产品"
+            ))
+
+    def clear(self):
+        self.set_products([])
+
+    def set_nas_root(self, path: str):
+        self._nas_root = path
+
+
+# ── 工具函数 ─────────────────────────────────────────────────────
+def _guess_image_set(folder_name: str) -> str:
+    """从文件夹名猜测 image_set 类型标签。"""
+    mapping = {
+        "中文": "中文", "英语": "英语", "英文": "英语",
+        "西班牙语": "西语", "俄语": "俄语", "韩语": "韩语",
+        "印尼语": "印尼", "泰语": "泰语", "法文": "法语",
+        "渲染图": "渲染", "实拍图": "实拍",
+        "主图": "主图", "详情": "详情",
+        "亚马逊": "亚马逊", "停售": "停售", "停用": "停售",
+        "暂未售": "停售",
+    }
+    for key, label in mapping.items():
+        if key in folder_name:
+            return label
+    return ""
+
+
+def _extract_category(name: str) -> str:
+    """从产品名称提取分类标签。"""
+    keywords = [
+        "转接卡", "延长线", "硬盘盒", "数据线", "风扇", "水晶头",
+        "模块", "护套", "散热", "支架", "网卡", "阵列卡", "增高卡",
+        "拆分卡", "网线钳", "分配器", "采集卡", "转接线", "转换头",
+        "投屏线", "快充", "供电线", "转接板", "螺丝刀", "螺母",
+        "网络模块", "剥线刀", "水晶头护套",
+    ]
+    for kw in keywords:
+        if kw in name:
+            return kw
+    return ""
+
+
+def _extract_specs_from_name(name: str) -> dict:
+    """从产品名称中提取常见规格键值对。"""
+    specs = {}
+    # PCIe 版本
+    import re
+    m = re.search(r'PCIE?\s*(\d+\.?\d*)', name, re.IGNORECASE)
+    if m:
+        specs["接口版本"] = f"PCIe {m.group(1)}"
+    # 转接方向: M.2 / SATA / NVMe / X1 / X4 / X16
+    for k in ["M.2", "NVMe", "SATA", "X16", "X4", "X1"]:
+        if k in name:
+            specs.setdefault("规格", k)
+    # 尺寸: 2280 / 2242 / 2230 / 22110
+    m2 = re.search(r'(22\d{2}|22110)', name)
+    if m2:
+        specs["支持尺寸"] = m2.group(1)
+    # 长度: 25CM / 50CM
+    m3 = re.search(r'(\d+)CM', name, re.IGNORECASE)
+    if m3:
+        specs["线长"] = f"{m3.group(1)}CM"
+    # 颜色
+    for color in ["黑色", "白色", "红色", "蓝色", "绿色", "黄色", "青色", "灰色"]:
+        if color in name:
+            specs["颜色"] = color
+            break
+    return specs
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RightPanel — 产品工作台
+# ═══════════════════════════════════════════════════════════════════
+class RightPanel(QWidget):
+    """右侧产品工作台：固定身份条 + 可滚动卡片区域。
+
+    卡片从上到下：
+      ① 产品身份条（固定）- 69码 + 名称 + 操作按钮
+      ② 规格参数卡片 - 产品属性（动态，按 spec_group 分组）
+      ③ 产品图片卡片 - 缩略图网格
+      ④ AI 工作台卡片（未来）
+    """
+
+    open_folder_requested = Signal(str)
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self.setObjectName("rightPanel")
+        self._product: dict = {}
+        self._nas_root = ""
+        self._images: list[dict] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── ① ProductIdentityBar（固定顶部） ──
+        self.identity = ProductIdentityBar()
+        self.identity.open_folder_requested.connect(self.open_folder_requested)
+        layout.addWidget(self.identity)
+
+        # ── 可滚动卡片区域 ──
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("rightScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("scrollContent")
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(0, 0, 0, 12)
+        self.scroll_layout.setSpacing(8)
+
+        # ── ② SpecsCard（产品详情优先） ──
+        self.specs_card = SpecsCard()
+        self.scroll_layout.addWidget(self.specs_card)
+
+        # ── ③ ImageCard（图片在下方） ──
+        self.image_card = ImageCard()
+        self.image_card.open_image_requested.connect(self._on_open_image)
+        self.image_card.open_folder_requested.connect(self.open_folder_requested)
+        self.scroll_layout.addWidget(self.image_card)
+
+        # ── ④ AICard（未来：阶段 7） ──
+        self.ai_card = AICard()
+        self.scroll_layout.addWidget(self.ai_card)
+
+        self.scroll_layout.addStretch()
+        self.scroll.setWidget(self.scroll_content)
+        layout.addWidget(self.scroll, 1)
+
+    def show_empty(self):
+        self.identity.clear()
+        self.specs_card.clear()
+        self.image_card.clear()
+        self.ai_card.clear()
+
+    def set_product(self, product: dict, images: list[dict], nas_root: str = ""):
+        self._product = product
+        self._nas_root = nas_root
+        self._images = images
+
+        pid = product.get("product_id")
+
+        self.identity.set_product(product, nas_root)
+        # 动态规格：从 product_specs 表读取
+        specs = self._db.get_product_specs(pid) if pid else []
+        self.specs_card.set_specs(specs, product)
+        # 图片
+        self.image_card.set_images(images, nas_root)
+        self.ai_card.set_product(product)
+
+    def _on_open_image(self, path: str):
+        _safe_open_file(path)
+
+
+# ── ① ProductIdentityBar ─────────────────────────────────────────
+class ProductIdentityBar(QWidget):
+    """产品身份条：69码 + 名称 + 分类 + 操作按钮。"""
+
+    open_folder_requested = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("identityBar")
+        self.setFixedHeight(80)
+        self._full_code = ""
+        self._folder_path = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 8)
+        layout.setSpacing(6)
+
+        # 行1：69码 + 名称
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+        self.code_label = QLabel("")
+        self.code_label.setObjectName("identityCode")
+        self.code_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.code_label.mousePressEvent = lambda e: self._copy("69码", self._full_code)
+        row1.addWidget(self.code_label)
+
+        self.name_label = QLabel("")
+        self.name_label.setObjectName("identityName")
+        self.name_label.setWordWrap(True)
+        row1.addWidget(self.name_label, 1)
+
+        self.cat_label = QLabel("")
+        self.cat_label.setObjectName("identityCat")
+        row1.addWidget(self.cat_label)
+        layout.addLayout(row1)
+
+        # 行2：文件夹路径 + 操作按钮
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        self.path_label = QLabel("")
+        self.path_label.setObjectName("identityPath")
+        self.path_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.path_label.mousePressEvent = lambda e: self._copy("路径", self.path_label.toolTip() or self.path_label.text())
+        row2.addWidget(self.path_label, 1)
+
+        for text, slot, tip in [
+            ("📂 打开", self._open_folder, "打开文件夹"),
+            ("📋 69码", lambda: self._copy("69码", self._full_code), "复制69码"),
+            ("📋 名称", lambda: self._copy("名称", self.name_label.text()), "复制产品名称"),
+            ("📐 规格", self._copy_specs, "复制规格参数"),
+        ]:
+            btn = QPushButton(text)
+            btn.setObjectName("identityBtn")
+            btn.setFixedHeight(26)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            row2.addWidget(btn)
+
+        layout.addLayout(row2)
+
+    def set_product(self, product: dict, nas_root: str = ""):
+        self._full_code = product.get("full_code", "")
+        self._folder_path = product.get("folder_path", "")
+        name = product.get("name", "")
+        category = product.get("category", "")
+
+        full_path = _resolve_path(self._folder_path, nas_root)
+
+        self.code_label.setText(self._full_code)
+        self.name_label.setText(name)
+        self.cat_label.setText(f"🏷️ {category}" if category else "")
+        display = full_path if len(full_path) <= 70 else "…" + full_path[-67:]
+        self.path_label.setText(display)
+        self.path_label.setToolTip(full_path)
+
+    def _open_folder(self):
+        if self._folder_path:
+            self.open_folder_requested.emit(self._folder_path)
+
+    def _copy(self, label: str, text: str):
+        if text:
+            QApplication.clipboard().setText(text)
+            QToolTip.showText(self.mapToGlobal(QPoint(0, -28)), f"已复制 {label}", self)
+
+    def _copy_specs(self):
+        """复制规格摘要到剪贴板。"""
+        parent = self.parent()
+        # 向上查找 RightPanel 获取 specs_card
+        while parent and not isinstance(parent, RightPanel):
+            parent = parent.parent()
+        if parent and hasattr(parent, 'specs_card'):
+            specs_text = parent.specs_card.get_specs_text()
+            if specs_text:
+                QApplication.clipboard().setText(specs_text)
+                QToolTip.showText(self.mapToGlobal(QPoint(0, -28)), "已复制规格", self)
+
+    def clear(self):
+        self.code_label.setText("")
+        self.name_label.setText("")
+        self.cat_label.setText("")
+        self.path_label.setText("点击左侧产品查看详情")
+        self._full_code = ""
+        self._folder_path = ""
+
+
+# ── ② ImageCard ──────────────────────────────────────────────────
+class ImageCard(QWidget):
+    """产品图片卡片：按 image_set 分组展示缩略图。"""
+
+    open_image_requested = Signal(str)
+    open_folder_requested = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("imageCard")
+        self._nas_root = ""
+        self._images: list[dict] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+
+        # 标题
+        header = QHBoxLayout()
+        title = QLabel("📷 产品图片")
+        title.setObjectName("cardTitle")
+        header.addWidget(title)
+        header.addStretch()
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("cardCount")
+        header.addWidget(self.count_label)
+        layout.addLayout(header)
+
+        # 图片网格
+        self.grid_widget = QWidget()
+        self.grid = QGridLayout(self.grid_widget)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(8)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.grid_widget)
+
+    def set_images(self, images: list[dict], nas_root: str = ""):
+        self._clear_grid()
+        self._nas_root = nas_root
+        self._images = images
+
+        if not images:
+            self.count_label.setText("暂无图片")
+            empty = QLabel("该产品暂未关联图片\n请先导入产品并扫描图片目录")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setProperty("placeholderRole", "desc")
+            self.grid.addWidget(empty, 0, 0)
+            return
+
+        self.count_label.setText(f"{len(images)} 张")
+
+        # 按 image_set 分组排序：中文/英语优先
+        priority_order = {"中文": 0, "英语": 1, "主图": 2, "实拍图": 3, "渲染图": 4}
+        sorted_images = sorted(images, key=lambda i: priority_order.get(
+            _guess_image_set(i.get("folder_name", "")), 99
+        ))
+
+        # 计算列数（自适应）
+        parent_width = self.width()
+        cols = max(2, (parent_width - 56) // (GALLERY_SIZE + 8))
+
+        for i, img in enumerate(sorted_images):
+            w = self._make_thumb(img)
+            row, col = i // cols, i % cols
+            self.grid.addWidget(w, row, col, Qt.AlignmentFlag.AlignTop)
+
+    def _make_thumb(self, img: dict) -> QWidget:
+        full_unc = img.get("full_unc", "")
+        folder_path = img.get("folder_path", "")
+        folder_name = img.get("folder_name", "")
+        file_name = img.get("file_name", "")
+        set_type = _guess_image_set(folder_name)
+
+        container = QWidget()
+        container.setFixedSize(GALLERY_SIZE + 4, GALLERY_SIZE + 22)
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(2, 2, 2, 0)
+        vbox.setSpacing(1)
+
+        # 缩略图
+        thumb = QLabel()
+        thumb.setFixedSize(GALLERY_SIZE, GALLERY_SIZE)
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.setObjectName("cardThumb")
+        thumb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+        path = _resolve_path(full_unc, self._nas_root)
+        if os.path.isfile(path):
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            reader.setScaledSize(QSize(GALLERY_SIZE, GALLERY_SIZE))
+            pix = QPixmap.fromImageReader(reader)
+            if not pix.isNull():
+                thumb.setPixmap(pix)
+            else:
+                thumb.setText("🖼️")
+                thumb.setProperty("placeholderRole", "icon")
+        else:
+            thumb.setText("📁")
+            thumb.setProperty("placeholderRole", "icon")
+
+        # 交互
+        resolved = path
+        thumb.mouseDoubleClickEvent = lambda e, p=resolved: self.open_image_requested.emit(p)
+        thumb.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        thumb.customContextMenuRequested.connect(
+            lambda pos, p=resolved, fp=folder_path: self._context_menu(pos, p, fp)
+        )
+        vbox.addWidget(thumb)
+
+        # 角标
+        if set_type:
+            badge = QLabel(set_type, container)
+            badge.setObjectName("galleryBadge")
+            badge.setGeometry(GALLERY_SIZE - 50, GALLERY_SIZE - 18, 48, 16)
+
+        return container
+
+    def _context_menu(self, pos, full_path: str, folder_path: str):
+        menu = QMenu(self)
+        if full_path and os.path.isfile(full_path):
+            menu.addAction("🖼️ 打开原图", lambda p=full_path: _safe_open_file(p))
+        if folder_path:
+            menu.addAction("📁 打开文件夹", lambda fp=folder_path: self.open_folder_requested.emit(fp))
+        menu.addAction("📋 复制路径", lambda t=full_path: QApplication.clipboard().setText(t))
+        menu.exec(self.mapToGlobal(pos))
+
+    def _clear_grid(self):
+        while self.grid.count():
+            child = self.grid.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def clear(self):
+        self._clear_grid()
+        self.count_label.setText("")
+        self._images = []
+
+
+# ── ② SpecsCard（动态规格，详情优先） ──────────────────────────
+class SpecsCard(QWidget):
+    """规格参数卡片 — 完全动态：从 product_specs 表读取，按 spec_group 分组。
+
+    不硬编码任何规格字段。知识库 (JSONL) 或 CSV 导入什么就展示什么。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("specsCard")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(6)
+
+        title = QLabel("📋 产品详情")
+        title.setObjectName("cardTitle")
+        layout.addWidget(title)
+
+        self.content = QVBoxLayout()
+        self.content.setSpacing(4)
+        layout.addLayout(self.content)
+
+    def set_specs(self, specs: list[dict], product: dict = None):
+        self._clear()
+        product = product or {}
+
+        # 从 product_specs 表读取（动态 + 分组）
+        if specs:
+            groups: dict[str, list[dict]] = {}
+            for s in specs:
+                g = s.get("group", "基本规格")
+                groups.setdefault(g, []).append(s)
+
+            for group_name, items in groups.items():
+                # 分组标题
+                group_label = QLabel(_spec_group_icon(group_name) + " " + group_name)
+                group_label.setObjectName("specGroupTitle")
+                self.content.addWidget(group_label)
+
+                for item in items:
+                    self._add_spec_row(item["name"], item["value"], item.get("source", ""))
+        else:
+            # 无规格时尝试从名称提取 + 提示
+            name = product.get("name", "")
+            extracted = _extract_specs_from_name(name)
+            if extracted:
+                group_label = QLabel("📐 自动识别")
+                group_label.setObjectName("specGroupTitle")
+                self.content.addWidget(group_label)
+                for k, v in extracted.items():
+                    self._add_spec_row(k, v, "auto")
+
+            hint = QLabel("导入 CSV 或知识库后可显示完整规格")
+            hint.setObjectName("specsEmpty")
+            self.content.addWidget(hint)
+
+        self.content.addStretch()
+
+    def _add_spec_row(self, name: str, value: str, source: str = ""):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        k = QLabel(name)
+        k.setObjectName("specKey")
+        k.setFixedWidth(90)
+        row.addWidget(k)
+        v = QLabel(value)
+        v.setObjectName("specValue")
+        v.setWordWrap(True)
+        v.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        v.mousePressEvent = lambda e, val=value, lbl=v: (
+            QApplication.clipboard().setText(val),
+            QToolTip.showText(lbl.mapToGlobal(QPoint(0, -24)), f"已复制 {val}", lbl)
+        )
+        row.addWidget(v, 1)
+        self.content.addLayout(row)
+
+    def get_specs_text(self) -> str:
+        lines = []
+        for i in range(self.content.count()):
+            item = self.content.itemAt(i)
+            w = item.widget()
+            if isinstance(w, QLabel) and w.objectName() == "specGroupTitle":
+                lines.append(f"\n【{w.text()}】")
+            elif isinstance(item, QHBoxLayout):
+                kids = []
+                for j in range(item.count()):
+                    cw = item.itemAt(j).widget()
+                    if isinstance(cw, QLabel):
+                        kids.append(cw.text())
+                if len(kids) >= 2:
+                    lines.append(f"{kids[0]}：{kids[1]}")
+        return "\n".join(lines).strip()
+
+    def _clear(self):
+        while self.content.count():
+            child = self.content.takeAt(0)
+            if isinstance(child, QHBoxLayout):
+                while child.count():
+                    sub = child.takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+            elif child.widget():
+                child.widget().deleteLater()
+
+    def clear(self):
+        self._clear()
+
+
+def _spec_group_icon(group: str) -> str:
+    icons = {"物理参数": "📐", "报关信息": "🛃", "基本规格": "📦",
+             "接口": "🔌", "性能": "⚡"}
+    return icons.get(group, "📌")
+
+
+# ── ④ AICard（未来：阶段 7）──────────────────────────────────────
+class AICard(QWidget):
+    """AI 工作台卡片 — 知识库就绪后激活。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("aiCard")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("🤖 AI 工作台")
+        title.setObjectName("cardTitle")
+        layout.addWidget(title)
+
+        hint = QLabel("知识库就绪后，此处可：\n"
+                      "· 一键生成英文/西班牙语产品描述\n"
+                      "· 提取产品卖点与标题优化\n"
+                      "· 根据截图 + 产品信息智能回复客户\n"
+                      "（阶段 7：LLM 产品分析脚本完成后激活）")
+        hint.setObjectName("aiHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def set_product(self, product: dict):
+        pass  # 未来：根据产品启用 AI 功能按钮
+
+    def clear(self):
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SearchTab — 主检索标签页
+# ═══════════════════════════════════════════════════════════════════
 class SearchTab(QWidget):
-    """📦 图片检索 — 搜索框 + 左侧文件夹列表 + 右侧图片网格。"""
+    """📦 图片检索 — 产品优先布局。"""
 
-    # 对外信号：状态变更（用于主窗口状态栏更新）
     status_changed = Signal()
 
     def __init__(self, database: Database, config: Config, parent=None):
@@ -27,6 +960,8 @@ class SearchTab(QWidget):
         self._cfg = config
         self._scan_thread: QThread | None = None
         self._scan_worker: ScanWorker | None = None
+        self._current_products: list[dict] = []
+        self._current_product: dict | None = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -34,541 +969,131 @@ class SearchTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── 搜索栏容器 ──
-        search_container = QWidget()
-        search_container.setObjectName("searchContainer")
-        search_layout = QHBoxLayout(search_container)
-        search_layout.setContentsMargins(14, 10, 14, 10)
+        # ── 搜索栏 ──
+        self.search_bar = SearchBar()
+        self.search_bar.search_triggered.connect(self._on_search)
+        self.search_bar.clear_triggered.connect(self._on_clear)
+        layout.addWidget(self.search_bar)
 
-        # 搜索图标
-        search_icon = QLabel("🔎")
-        search_icon.setFixedWidth(22)
-        search_icon.setStyleSheet("font-size: 15px;")
-        search_layout.addWidget(search_icon)
-
-        # 搜索输入
-        self.search_input = QLineEdit()
-        self.search_input.setObjectName("searchInput")
-        self.search_input.setPlaceholderText("输入 69 码、关键字，或拖入图片搜索…")
-        self.search_input.setFixedHeight(38)
-        self.search_input.setAcceptDrops(True)
-        search_layout.addWidget(self.search_input)
-        layout.addWidget(search_container)
-
-        # ── 菜单按钮栏 ──
+        # ── 工具栏（精简） ──
         toolbar = QWidget()
         toolbar.setObjectName("searchToolbar")
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(14, 6, 14, 6)
-        toolbar_layout.setSpacing(6)
+        tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(14, 4, 14, 4)
+        tb_layout.setSpacing(6)
 
-        self.btn_import = QPushButton("📥 导入产品")
-        self.btn_import.setToolTip("从 Excel 导入产品数据")
-        self.btn_import.setProperty("toolbarButton", "yes")
-        self.btn_import.clicked.connect(self._on_import_products)
-        toolbar_layout.addWidget(self.btn_import)
+        btn_import = QPushButton("📥 导入CSV")
+        btn_import.setToolTip("从CSV/Excel导入产品数据")
+        btn_import.setProperty("toolbarButton", "yes")
+        btn_import.clicked.connect(self._on_import_products)
+        tb_layout.addWidget(btn_import)
 
-        self.btn_inc_scan = QPushButton("🔄 增量扫描")
-        self.btn_inc_scan.setToolTip("扫描新增图片")
-        self.btn_inc_scan.setProperty("toolbarButton", "yes")
-        self.btn_inc_scan.clicked.connect(self._on_incremental_scan)
-        toolbar_layout.addWidget(self.btn_inc_scan)
+        btn_scan = QPushButton("🔄 增量扫描")
+        btn_scan.setToolTip("扫描新增图片")
+        btn_scan.setProperty("toolbarButton", "yes")
+        btn_scan.clicked.connect(self._on_incremental_scan)
+        tb_layout.addWidget(btn_scan)
 
-        self.btn_full_scan = QPushButton("🔁 重建索引")
-        self.btn_full_scan.setToolTip("全量重建所有索引")
-        self.btn_full_scan.setProperty("toolbarButton", "yes")
-        self.btn_full_scan.clicked.connect(self._on_full_scan)
-        toolbar_layout.addWidget(self.btn_full_scan)
+        btn_full = QPushButton("🔁 重建索引")
+        btn_full.setToolTip("全量重建索引")
+        btn_full.setProperty("toolbarButton", "yes")
+        btn_full.clicked.connect(self._on_full_scan)
+        tb_layout.addWidget(btn_full)
 
-        toolbar_layout.addStretch()
+        tb_layout.addStretch()
 
-        # 状态指示器
         self.status_label = QLabel("就绪")
         self.status_label.setObjectName("searchStatusLabel")
-        toolbar_layout.addWidget(self.status_label)
+        tb_layout.addWidget(self.status_label)
 
-        # 设置按钮
-        self.btn_settings = QPushButton("⚙️")
-        self.btn_settings.setToolTip("设置 NAS 路径与查看统计")
-        self.btn_settings.setProperty("toolbarButton", "yes")
-        self.btn_settings.clicked.connect(self._on_open_settings)
-        toolbar_layout.addWidget(self.btn_settings)
+        btn_settings = QPushButton("⚙️")
+        btn_settings.setToolTip("设置")
+        btn_settings.setProperty("toolbarButton", "yes")
+        btn_settings.clicked.connect(self._on_open_settings)
+        tb_layout.addWidget(btn_settings)
 
         layout.addWidget(toolbar)
 
-        # ── 文件夹路径条（点击复制） ──
-        self.path_bar = QLabel("请选择左侧结果")
-        self.path_bar.setObjectName("pathBar")
-        self.path_bar.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.path_bar.setToolTip("点击复制路径")
-        self.path_bar.setMinimumHeight(26)
-        self.path_bar.setWordWrap(False)
-        self.path_bar.mousePressEvent = self._on_path_bar_click
-        layout.addWidget(self.path_bar)
-
-        # ── 结果区域 — 左右分割 ──
+        # ── 左右分栏 ──
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setObjectName("searchSplitter")
-        self.splitter.setHandleWidth(0)  # 固定不可拖拽
+        self.splitter.setHandleWidth(2)
 
-        # ── 左侧面板 — 搜索结果列表 ──
-        left_card = Card(padding=6)
-        self.result_list = QListWidget()
-        self.result_list.setObjectName("searchResultList")
-        self.result_list.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.result_list.setWordWrap(True)
-        left_card.content.addWidget(self.result_list)
+        # 左侧：产品列表
+        self.product_list = ProductList(self._cfg.nas_root_path)
+        self.product_list.product_selected.connect(self._on_product_selected)
+        self.product_list.product_double_clicked.connect(self._open_folder)
+        self.splitter.addWidget(self.product_list)
 
-        # 复制全部69码按钮
-        self.btn_copy_codes = QPushButton("📋 复制全部69码")
-        self.btn_copy_codes.setToolTip("复制当前列表所有69码（换行分隔）")
-        self.btn_copy_codes.setProperty("toolbarButton", "yes")
-        self.btn_copy_codes.clicked.connect(self._on_copy_all_codes)
-        self.btn_copy_codes.setVisible(False)
-        left_card.content.addWidget(self.btn_copy_codes)
+        # 右侧：产品工作台
+        self.right_panel = RightPanel(self._db)
+        self.right_panel.open_folder_requested.connect(self._open_folder)
+        self.splitter.addWidget(self.right_panel)
+        self.splitter.setSizes([420, 780])
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
 
-        self.splitter.addWidget(left_card)
-
-        # ── 右侧面板 — 图片缩略图网格 ──
-        right_card = Card(padding=6)
-        self.thumb_scroll = QScrollArea()
-        self.thumb_scroll.setObjectName("thumbScroll")
-        self.thumb_scroll.setWidgetResizable(True)
-        self.thumb_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.thumb_container = QWidget()
-        self.thumb_grid = QGridLayout(self.thumb_container)
-        self.thumb_grid.setContentsMargins(4, 4, 4, 4)
-        self.thumb_grid.setSpacing(6)
-        self.thumb_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.thumb_scroll.setWidget(self.thumb_container)
-        right_card.content.addWidget(self.thumb_scroll)
-        self.splitter.addWidget(right_card)
-
-        self.splitter.setSizes([290, 210])
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 0)  # 右侧固定 210px
         layout.addWidget(self.splitter, 1)
 
-        # 缩略图缓存
-        self._thumb_cache: dict[str, list[QPixmap]] = {}  # folder_path → pixmaps
-        self._search_results: list[dict] = []
-        self._all_codes: list[str] = []
-
-        # 搜索输入 — 400ms 防抖自动搜索 + 回车立即搜索
-        self._search_timer = QTimer(self)
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(400)
-        self._search_timer.timeout.connect(self._on_search)
-        self.search_input.textChanged.connect(self._on_input_changed)
-        self.search_input.returnPressed.connect(self._on_search)
-
-    # 当前高亮的行容器引用（用于取消旧选中）
-    _selected_row: "QWidget | None" = None
-    _SELECTION_STYLE = "background-color: #F0FFF0; border-radius: 4px;"
-
-    def _highlight_row(self, item: QListWidgetItem):
-        """给 item 的行容器设置稳定选中底色，同时清除旧选中。"""
-        if self._selected_row is not None:
-            try:
-                self._selected_row.setStyleSheet("")
-            except RuntimeError:
-                pass
-            self._selected_row = None
-
-        row = self.result_list.itemWidget(item)
-        if row is not None:
-            row.setStyleSheet(self._SELECTION_STYLE)
-            self._selected_row = row
-
-    def _auto_select_first(self):
-        """搜索完成后自动选中第一个结果 + 加载缩略图。"""
-        if self.result_list.count() == 0:
-            self._show_placeholder_right()
-            return
-        first = self.result_list.item(0)
-        folder_path = first.data(Qt.ItemDataRole.UserRole)
-        if not folder_path:
-            self._show_placeholder_right()
-            return
-
-        self.result_list.setCurrentItem(first)
-        self.result_list.scrollToTop()
-        self._highlight_row(first)
-
-        full = self._resolve_path(folder_path)
-        self.path_bar.setText(full or folder_path)
-        self._load_thumbnails(folder_path)
-
-    # ── 搜索分发 ──────────────────────────────────────────────────
-    def _on_input_changed(self, _text: str):
-        """每次击键重置计时器，停止输入 400ms 后自动搜索。"""
-        self._search_timer.start()
-
-    def _on_search(self):
-        query = self.search_input.text().strip()
-        self._search_timer.stop()
+    # ── 搜索 ──────────────────────────────────────────────────────
+    def _on_search(self, query: str):
         if not query:
-            self.result_list.clear()
-            self._show_placeholder_right()
-            self.path_bar.setText("请选择左侧结果")
+            self._on_clear()
             return
+        results = self._db.search_products(query)
 
-        # 通过模型插件体系解析查询意图
-        analyzer = _get_model_instance("query_analyzers", "LocalQueryAnalyzer") if _get_model_instance else None
-        if analyzer is not None:
-            intent = analyzer.analyze(query)
-        else:
-            # 降级：插件不可用时直接判断
-            if query.isdigit():
-                intent = type("Intent", (), {"mode": "code", "include_terms": [query]})()
-            else:
-                intent = type("Intent", (), {"mode": "keyword", "include_terms": [query]})()
-
-        if intent.mode == "code":
-            self._do_code_search(query)
-        else:
-            self._do_keyword_search(query)
-
-    def _do_code_search(self, query: str):
-        """69码渐进匹配。"""
-        results = self._db.search_folders_by_code_tail(query)
-        self._search_results = results
-        self._populate_list(results)
-        self._auto_select_first()
-        n = len(query)
-        if n < 4:
-            hint = f"（输入 {4-n} 位以精确匹配）"
-        elif n == 4:
-            hint = "（精确后四位匹配）"
-        else:
-            hint = f"（已输入 {n} 位，逐步收敛中）"
-        self.status_label.setText(
-            f"69码 \"{query}\" — {len(results)} 个结果 {hint}"
-        )
-
-    def _do_keyword_search(self, query: str):
-        """关键字搜索：匹配文件夹名。"""
-        results = self._db.search_folders_by_keyword(query)
-        self._search_results = results
-        self._populate_list(results)
-        self._auto_select_first()
-        self.status_label.setText(
-            f"关键字搜索 \"{query}\" — {len(results)} 个结果"
-        )
-
-    # ── 列表项格式化（可扩展接口） ──────────────────────────────────
-    # 后续阶段可接入 AI 对 name / description 做简化处理。
-    # 只需修改这两个方法的返回值，不影响 UI 框架。
-
-    @staticmethod
-    def _fmt_folder_label(folder_name: str) -> str:
-        """
-        文件夹名显示文本。
-        扩展点：后续可接入 AI 对文件夹名做智能简化 / 翻译。
-        """
-        return f"名称：{folder_name}"
-
-    @staticmethod
-    def _fmt_product_label(product_name: str, full_code: str) -> str:
-        """
-        产品标签显示文本。
-        扩展点：后续可接入 AI 对产品名/描述做摘要/翻译。
-        """
-        return f"描述：{product_name} ({full_code})"
-
-    def _populate_list(self, results: list[dict]):
-        """填充左侧结果列表。每项三行独立可复制：文件夹名/产品描述/69码。"""
-        self.result_list.clear()
-        self.btn_copy_codes.setVisible(False)
-
-        if not results:
-            item = QListWidgetItem("  无匹配结果")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.result_list.addItem(item)
-            return
-
-        has_codes = False
+        # 为每个产品补充：主图路径、分类
         for r in results:
-            folder = r.get("folder_name", "")
-            product = r.get("product_name", "")
-            code = r.get("full_code", "")
-            img_count = r.get("image_count", 0)
-            folder_path = r.get("folder_path", "")
-
-            # ── 行容器（点击非按钮区域 → 加载缩略图） ──
-            row = QWidget()
-            row.setCursor(Qt.CursorShape.PointingHandCursor)
-
-            vbox = QVBoxLayout(row)
-            vbox.setContentsMargins(6, 4, 6, 4)
-            vbox.setSpacing(1)
-
-            # 行1：文件夹名称 + 复制
-            self._add_copy_row(vbox, "文件夹名称", folder)
-
-            # 行2：产品描述（如有） + 复制
-            if product:
-                self._add_copy_row(vbox, "产品描述", product)
-                has_codes = True
+            # 从名称提取分类
+            r["category"] = _extract_category(r.get("name", ""))
+            # 主图路径
+            main_path = self._db.get_product_main_image_path(r["product_id"])
+            if main_path:
+                nas_root = self._cfg.nas_root_path
+                r["main_image_path"] = (
+                    os.path.join(nas_root, main_path)
+                    if nas_root and not os.path.isabs(main_path)
+                    else main_path
+                )
             else:
-                # 无关联产品时显示图片数量
-                self._add_info_row(vbox, f"图片数量：{img_count}" if img_count else "无关联产品")
+                r["main_image_path"] = ""
 
-            # 行3：69码（如有） + 复制
-            if code:
-                self._add_copy_row(vbox, "69码", code)
-                has_codes = True
+        self._current_products = results
+        self.product_list.set_products(results)
 
-            # 嵌入到 QListWidgetItem — 计算正确高度
-            vp_width = self.result_list.viewport().width()
-            row.setFixedWidth(max(vp_width - 4, 240))
-            hint = row.sizeHint()
-            hint.setHeight(hint.height() + 6)
-            item = QListWidgetItem()
-            item.setSizeHint(hint)
-            item.setData(Qt.ItemDataRole.UserRole, folder_path)
-            self.result_list.addItem(item)
-            self.result_list.setItemWidget(item, row)
+        n = len(results)
+        self.status_label.setText(f"搜索完成：{n} 个产品")
 
-            def _make_row_handler(_row, _fp, _item):
-                def _handler(event):
-                    child = _row.childAt(event.position().toPoint())
-                    if child is not None:
-                        if isinstance(child, QPushButton):
-                            return
-                        p = child.parent()
-                        while p and p is not _row:
-                            if isinstance(p, QPushButton):
-                                return
-                            p = p.parent()
-                    self._on_item_click(_fp, _item)
-                return _handler
+    def _on_clear(self):
+        self._current_products = []
+        self._current_product = None
+        self.product_list.clear()
+        self.right_panel.show_empty()
+        self.status_label.setText("就绪")
 
-            row.mousePressEvent = _make_row_handler(row, folder_path, item)
+    # ── 产品选中 ──────────────────────────────────────────────────
+    def _on_product_selected(self, product: dict):
+        self._current_product = product
+        product_id = product["product_id"]
 
-        self._all_codes = [r.get("full_code", "") for r in results if r.get("full_code")]
-        self.btn_copy_codes.setVisible(has_codes)
+        images = self._db.get_images_for_product(product_id)
+        self.right_panel.set_product(product, images, self._cfg.nas_root_path)
 
-    @staticmethod
-    def _add_info_row(parent_layout: QVBoxLayout, text: str):
-        """添加一行纯信息（不可复制）。"""
-        label = QLabel(text)
-        label.setObjectName("itemSubLabel")
-        parent_layout.addWidget(label)
+    def _open_folder(self, path: str):
+        _safe_open_folder(path, self._cfg.nas_root_path)
 
-    @staticmethod
-    def _add_copy_row(parent_layout: QVBoxLayout, label_text: str, value: str):
-        """添加一行：标签 + 值 + 复制按钮。"""
-        hbox = QHBoxLayout()
-        hbox.setContentsMargins(0, 0, 0, 0)
-        hbox.setSpacing(4)
-
-        lbl = QLabel(f"{label_text}：{value}")
-        lbl.setWordWrap(True)
-        lbl.setObjectName("itemFieldLabel")
-        hbox.addWidget(lbl, 1)
-
-        btn = QPushButton()
-        btn.setFixedSize(22, 22)
-        btn.setFlat(True)
-        btn.setToolTip(f"复制{label_text}")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setObjectName("copyBtn")
-        btn.setIcon(SearchTab._copy_icon())
-        btn.setIconSize(QSize(14, 14))
-        btn.clicked.connect(lambda checked, v=value, b=btn: SearchTab._do_copy(v, b))
-        hbox.addWidget(btn)
-
-        parent_layout.addLayout(hbox)
-
-    @staticmethod
-    def _copy_icon() -> QIcon:
-        """绘制复制图标（双矩形，中性灰适配暗/亮主题）。"""
-        pix = QPixmap(28, 28)
-        pix.fill(Qt.GlobalColor.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # 后方矩形（填充）
-        p.setBrush(QColor(120, 130, 150))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(8, 1, 16, 18, 3, 3)
-        # 前方矩形（填充 + 描边）
-        p.setBrush(QColor(160, 170, 190))
-        p.setPen(QPen(QColor(100, 110, 130), 2))
-        p.drawRoundedRect(3, 7, 16, 18, 3, 3)
-        p.end()
-        return QIcon(pix)
-
-    @staticmethod
-    def _do_copy(text: str, btn: QPushButton | None = None):
-        """复制文本到剪贴板，并在按钮旁显示提示。"""
-        from PySide6.QtWidgets import QApplication as QA, QToolTip
-        QA.clipboard().setText(text)
-        if btn is not None:
-            QToolTip.showText(btn.mapToGlobal(QPoint(0, -28)), "已复制！", btn)
-
-    def _resolve_path(self, rel_path: str) -> str:
-        """在多个 NAS 路径中查找第一个存在的完整路径。"""
-        if os.path.isabs(rel_path):
-            return rel_path if os.path.exists(rel_path) else ""
-        for root in self._cfg.nas_root_paths:
-            full = os.path.join(root, rel_path)
-            if os.path.exists(full):
-                return full
-        # 回退到第一个路径
-        if self._cfg.nas_root_paths:
-            return os.path.join(self._cfg.nas_root_paths[0], rel_path)
-        return rel_path
-
-    def _on_item_click(self, folder_path: str, item: QListWidgetItem | None = None):
-        """点击列表项 → 高亮行 + 加载缩略图 + 显示路径。"""
-        if not folder_path:
-            return
-        if item is not None:
-            self.result_list.setCurrentItem(item)
-            self._highlight_row(item)
-        full = self._resolve_path(folder_path)
-        self.path_bar.setText(full or folder_path)
-        self._load_thumbnails(folder_path)
-
-    # ── 复制行为 ──────────────────────────────────────────────────
-    def _on_copy_all_codes(self):
-        """复制当前列表所有69码（换行分隔）。"""
-        if self._all_codes:
-            from PySide6.QtWidgets import QApplication as QA
-            QA.clipboard().setText("\n".join(self._all_codes))
-            self.status_label.setText(f"已复制 {len(self._all_codes)} 个69码")
-        else:
-            self.status_label.setText("无69码可复制")
-
-    # ── 路径条 ────────────────────────────────────────────────────
-
-    def _on_path_bar_click(self, _event):
-        """点击路径条 → 复制到剪贴板。"""
-        text = self.path_bar.text()
-        if text and text != "请选择左侧结果":
-            from PySide6.QtWidgets import QApplication as QA
-            QA.clipboard().setText(text)
-            self.status_label.setText("路径已复制")
-
-    # ── 缩略图网格 ────────────────────────────────────────────────
-    def _show_placeholder_right(self):
-        """清空右侧并显示占位提示。"""
-        self._clear_thumb_grid()
-        hint = QLabel("选择左侧结果\n查看对应图片")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setProperty("placeholderRole", "title")
-        self.thumb_grid.addWidget(hint, 0, 0)
-
-    def _clear_thumb_grid(self):
-        """清空缩略图网格。"""
-        while self.thumb_grid.count():
-            child = self.thumb_grid.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-
-    def _load_thumbnails(self, folder_path: str):
-        """同步加载缩略图（setScaledSize 已很快，processEvents 防卡顿）。"""
-        if folder_path in self._thumb_cache:
-            self._render_thumb_grid(self._thumb_cache[folder_path])
-            return
-
-        images = self._db.get_images_by_folder(folder_path)
-        if not images:
-            self.status_label.setText("该文件夹无图片")
-            return
-
-        pixmaps = []
-        for i, img in enumerate(images):
-            full_path = img["full_unc"]
-            if not os.path.isabs(full_path):
-                full_path = self._resolve_path(full_path)
-            reader = QImageReader(full_path)
-            reader.setAutoTransform(True)
-            reader.setScaledSize(QSize(200, 160))
-            pix = QPixmap.fromImageReader(reader)
-            pixmaps.append((pix if not pix.isNull() else QPixmap(), img))
-            # 每 5 张让事件循环喘口气，UI 不冻结
-            if i % 5 == 0:
-                QApplication.processEvents()
-
-        if len(self._thumb_cache) >= 3:
-            oldest = next(iter(self._thumb_cache))
-            del self._thumb_cache[oldest]
-        self._thumb_cache[folder_path] = pixmaps
-
-        self._render_thumb_grid(pixmaps)
-        self.status_label.setText(f"{len(images)} 张图片")
-
-    def _render_thumb_grid(self, pixmaps: list):
-        """渲染缩略图到网格（单列）。"""
-        self._clear_thumb_grid()
-        for i, (pix, img) in enumerate(pixmaps):
-
-            container = QWidget()
-            container.setObjectName("thumbItem")
-            vbox = QVBoxLayout(container)
-            vbox.setContentsMargins(2, 2, 2, 2)
-            vbox.setSpacing(2)
-
-            thumb_label = QLabel()
-            thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb_label.setFixedSize(200, 160)
-            if not pix.isNull():
-                thumb_label.setPixmap(pix)
-            else:
-                thumb_label.setText("🖼️\n无法加载")
-                thumb_label.setProperty("placeholderRole", "title")
-            thumb_label.setObjectName("thumbImage")
-            vbox.addWidget(thumb_label, alignment=Qt.AlignmentFlag.AlignCenter)
-
-            # 文件名标签
-            fname = img.get("file_name", "") if isinstance(img, dict) else ""
-            name_label = QLabel(fname if len(fname) <= 18 else fname[:16] + "…")
-            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            name_label.setObjectName("thumbFileName")
-            name_label.setWordWrap(False)
-            vbox.addWidget(name_label, alignment=Qt.AlignmentFlag.AlignCenter)
-
-            # 点击打开文件夹位置
-            folder = img.get("folder_path", "") if isinstance(img, dict) else ""
-            thumb_label.setToolTip(f"点击打开文件夹: {folder}")
-            thumb_label.setCursor(Qt.CursorShape.PointingHandCursor)
-            thumb_label._folder_path = folder
-            thumb_label.mousePressEvent = (
-                lambda e, p=folder: self._open_folder(p)
-            )
-
-            self.thumb_grid.addWidget(container, i, 0)
-
-    def _open_folder(self, folder_path: str):
-        """在资源管理器中打开文件夹。"""
-        if not folder_path:
-            return
-        full = self._resolve_path(folder_path)
-        if full and os.path.exists(full):
-            os.startfile(full)
-
-    # ── 工具栏按钮事件 ──────────────────────────────────────────────
+    # ── 工具栏按钮事件（同原版）───────────────────────────────────
     def _on_import_products(self):
-        """打开 Excel 导入对话框。"""
         dlg = ImportDialog(self._db, self)
         if dlg.exec() == ImportDialog.DialogCode.Accepted:
             self.status_changed.emit()
 
     def _on_incremental_scan(self):
-        """增量扫描 — 仅处理上次扫描后的新文件。"""
         self._start_scan(incremental=True)
 
     def _on_full_scan(self):
-        """全量重建索引 — 清空旧数据后重新扫描。"""
         reply = QMessageBox.question(
-            self,
-            "确认重建索引",
+            self, "确认重建索引",
             "将清空所有图片索引数据并重新扫描。\n"
             "现有的产品数据不受影响。\n\n确定继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -579,73 +1104,54 @@ class SearchTab(QWidget):
         self._start_scan(incremental=False)
 
     def _on_open_settings(self):
-        """打开设置对话框。"""
         dlg = SettingsDialog(self._db, self._cfg, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.status_changed.emit()
+            self.product_list.set_nas_root(self._cfg.nas_root_path)
 
     def _start_scan(self, incremental: bool):
-        """启动后台扫描线程（支持多 NAS 路径）。"""
-        running = False
         if self._scan_thread is not None:
             try:
-                running = self._scan_thread.isRunning()
+                if self._scan_thread.isRunning():
+                    QMessageBox.information(self, "扫描进行中", "上一次扫描尚未完成。")
+                    return
             except RuntimeError:
                 pass
-        if running:
-            QMessageBox.information(self, "扫描进行中", "上一次扫描尚未完成，请等待完成后再试。")
-            return
-
         self._scan_thread = None
         self._scan_worker = None
 
-        paths = self._cfg.nas_root_paths
-        if not paths:
-            QMessageBox.information(
-                self, "未配置 NAS 路径",
-                "尚未配置 NAS 图片根目录。\n\n"
-                "请点击工具栏右侧的 ⚙️ 按钮打开设置，选择图片所在的根目录后再进行扫描。"
-            )
+        root = self._cfg.nas_root_path
+        if not root:
+            QMessageBox.information(self, "未配置 NAS 路径",
+                "请点击 ⚙️ 设置图片根目录后再扫描。")
+            return
+        if not os.path.exists(root):
+            QMessageBox.critical(self, "路径不存在",
+                f"图片根目录不存在：\n{root}")
             return
 
-        # 全量扫描前清空索引
         if not incremental:
             self._db.clear_index()
 
         self._set_buttons_enabled(False)
         self.status_label.setText("扫描中…")
 
-        times = {}
-        if incremental:
-            for p in paths:
-                times[p] = self._cfg.get_scan_time(p)
-
-        self._scan_worker = ScanWorker(
-            self._db, paths,
-            incremental=incremental,
-            last_scan_times=times,
-        )
+        last_scan = self._cfg.last_scan_time if incremental else 0.0
+        self._scan_worker = ScanWorker(self._db, root,
+            incremental=incremental, last_scan_time=last_scan)
         self._scan_thread = ScanThread(self._scan_worker)
-        self._scan_worker.moveToThread(self._scan_thread)
 
         self._scan_worker.progress.connect(self._on_scan_progress)
-        self._scan_worker.path_label.connect(self._on_scan_path)
         self._scan_worker.status_message.connect(self._on_scan_status)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
-
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._scan_thread.finished.connect(self._scan_worker.deleteLater)
-
         self._scan_thread.start()
 
-    def _on_scan_path(self, label: str):
-        """当前扫描的路径标签。"""
-        self.status_label.setText(f"扫描 {label}")
-
     def _on_scan_progress(self, current: int, total: int):
-        self.status_label.setText(f"{self.status_label.text().split(' —')[0]} — {current}/{total}")
+        self.status_label.setText(f"扫描中… {current}/{total}")
 
     def _on_scan_status(self, msg: str):
         self.status_label.setText(msg)
@@ -653,14 +1159,12 @@ class SearchTab(QWidget):
     def _on_scan_finished(self, stats: dict):
         self._set_buttons_enabled(True)
         import time
-        for p in self._cfg.nas_root_paths:
-            self._cfg.set_scan_time(p, time.time())
+        self._cfg.last_scan_time = time.time()
         files = stats.get("files", 0)
         folders = stats.get("folders", 0)
         linked = stats.get("linked", 0)
         self.status_label.setText(
-            f"扫描完成：{files} 张图片, {folders} 个文件夹, {linked} 组关联"
-        )
+            f"扫描完成：{files} 张图, {folders} 个文件夹, {linked} 组关联")
         self.status_changed.emit()
 
     def _on_scan_error(self, msg: str):
@@ -669,22 +1173,20 @@ class SearchTab(QWidget):
         QMessageBox.critical(self, "扫描失败", msg)
 
     def _set_buttons_enabled(self, enabled: bool):
-        self.btn_import.setEnabled(enabled)
-        self.btn_inc_scan.setEnabled(enabled)
-        self.btn_full_scan.setEnabled(enabled)
-        self.btn_settings.setEnabled(enabled)
+        # 遍历工具栏中的按钮
+        toolbar = self.findChild(QWidget, "searchToolbar")
+        if toolbar:
+            for btn in toolbar.findChildren(QPushButton):
+                btn.setEnabled(enabled)
 
     def refresh_status(self):
-        """更新内部状态标签。"""
-        product_count = self._db.get_product_count()
         image_count = self._db.get_image_count()
+        product_count = self._db.get_product_count()
         if image_count > 0:
             folder_count = self._db.get_folder_count()
             self.status_label.setText(
-                f"{image_count} 张图片, {folder_count} 个文件夹"
-            )
+                f"{image_count} 张图, {folder_count} 个文件夹")
         elif product_count > 0:
             self.status_label.setText(f"就绪 ({product_count} 个产品)")
         else:
             self.status_label.setText("就绪 — 请导入产品或扫描目录")
-

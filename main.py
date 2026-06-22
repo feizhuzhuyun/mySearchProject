@@ -43,16 +43,17 @@ from theme import (
 from widgets import TitleBar, Card, Placeholder
 from settings_dialog import SettingsDialog
 from search_tab import SearchTab
+from knowledge_tab import KnowledgeTab
 
 # ---------------------------------------------------------------------------
 # 应用常量
 # ---------------------------------------------------------------------------
 APP_NAME = "元器件图片检索"
 APP_VERSION = "0.0.1"
-WINDOW_WIDTH = 500
-WINDOW_HEIGHT = 640
-WINDOW_MIN_WIDTH = 340
-WINDOW_MIN_HEIGHT = 420
+WINDOW_WIDTH = 1200
+WINDOW_HEIGHT = 750
+WINDOW_MIN_WIDTH = 900
+WINDOW_MIN_HEIGHT = 550
 TITLE_BAR_HEIGHT = 38
 RESIZE_MARGIN = 6  # 边缘拖拽缩放敏感区宽度
 
@@ -382,15 +383,12 @@ class MainWindow(ResizableWindow):
             parts.append(f"关联：{link_count} 组")
         self.status_index.setText(" | ".join(parts))
 
-        # NAS 路径（显示第一个，过多时缩略 + 数量）
-        paths = self._cfg.nas_root_paths
-        if paths:
-            label = paths[0]
-            if len(label) > 28:
-                label = "…" + label[-27:]
-            if len(paths) > 1:
-                label += f"  +{len(paths)-1}"
-            self.status_path.setText(f"📁 {label}")
+        # NAS 路径（过长时缩略）
+        root = self._cfg.nas_root_path
+        if root:
+            if len(root) > 30:
+                root = "…" + root[-29:]
+            self.status_path.setText(f"📁 {root}")
         else:
             self.status_path.setText("📁 未配置")
 
@@ -424,9 +422,12 @@ class MainWindow(ResizableWindow):
         self.tab_widget = QTabWidget()
         self.search_tab = SearchTab(self._db, self._cfg)
         self.search_tab.status_changed.connect(self._update_status_bar)
+        self.knowledge_tab = KnowledgeTab(self._db, self._cfg)
+        self.knowledge_tab.status_changed.connect(self._update_status_bar)
         self.ai_tab = AITab()
-        self.tab_widget.addTab(self.search_tab, "📦  图片检索")
-        self.tab_widget.addTab(self.ai_tab, "🤖  AI 助手")
+        self.tab_widget.addTab(self.search_tab, "📦 图片检索")
+        self.tab_widget.addTab(self.knowledge_tab, "🧠 知识库")
+        self.tab_widget.addTab(self.ai_tab, "🤖 AI 助手")
         content_layout.addWidget(self.tab_widget, 1)
 
         # 状态栏

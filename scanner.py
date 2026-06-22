@@ -38,7 +38,6 @@ class ScanWorker(QObject):
 
     # 信号
     progress = Signal(int, int)          # (current, total) — 文件级进度
-    path_label = Signal(str)             # 当前扫描的路径标签
     status_message = Signal(str)         # 当前状态文字
     finished = Signal(dict)              # 扫描完成统计
     error = Signal(str)                  # 错误信息
@@ -46,53 +45,33 @@ class ScanWorker(QObject):
     def __init__(
         self,
         database: Database,
-        root_paths: list[str],
+        root_path: str,
         incremental: bool = False,
-        last_scan_times: dict | None = None,
+        last_scan_time: float = 0.0,
     ):
         super().__init__()
         self._db = database
-        self._root_paths = root_paths
+        self._root_path = root_path
         self._incremental = incremental
-        self._last_scan_times = last_scan_times or {}
-
-    @staticmethod
-    def single_path(
-        database: Database, root_path: str,
-        incremental: bool = False, last_scan_time: float = 0.0,
-    ) -> "ScanWorker":
-        """向后兼容：单路径构造器。"""
-        times = {root_path: last_scan_time} if root_path else {}
-        return ScanWorker(database, [root_path], incremental, times)
+        self._last_scan_time = last_scan_time
 
     def run(self):
+        """扫描入口（在 QThread 中执行）。"""
         try:
-            stats = self._scan_all()
+            stats = self._scan()
             self.finished.emit(stats)
         except Exception as exc:
             self.error.emit(str(exc))
 
-    # ── 多路径扫描 ───────────────────────────────────────────────
-    def _scan_all(self) -> dict:
-        total_stats = {"files": 0, "folders": 0, "codes": 0, "linked": 0}
-        for i, root_path in enumerate(self._root_paths):
-            label = f"[{i+1}/{len(self._root_paths)}] {os.path.basename(root_path) or root_path}"
-            self.path_label.emit(label)
-            stats = self._scan_one(root_path)
-            for k in total_stats:
-                total_stats[k] += stats.get(k, 0)
-        return total_stats
-
-    def _scan_one(self, root_path: str) -> dict:
-        root = Path(root_path)
+    # ── 主扫描逻辑 ───────────────────────────────────────────────
+    def _scan(self) -> dict:
+        root = Path(self._root_path)
         if not root.exists():
-            self.status_message.emit(f"目录不存在，跳过: {root_path}")
-            return {"files": 0, "folders": 0, "codes": 0, "linked": 0}
+            raise FileNotFoundError(f"目录不存在: {self._root_path}")
 
-        last_scan = self._last_scan_times.get(root_path, 0.0) if self._incremental else 0.0
         self.status_message.emit("正在遍历目录…")
 
-        # Step 1: 收集图片文件
+        # Step 1: 收集所有图片文件
         all_files: list[dict] = []
         for dirpath, dirnames, filenames in os.walk(root):
             for fname in filenames:
@@ -109,7 +88,8 @@ class ScanWorker(QObject):
                 except OSError:
                     continue
 
-                if self._incremental and mtime <= last_scan:
+                # 增量模式：跳过未修改的文件
+                if self._incremental and mtime <= self._last_scan_time:
                     continue
 
                 all_files.append({
@@ -127,41 +107,58 @@ class ScanWorker(QObject):
 
         self.status_message.emit(f"发现 {total} 张图片，正在写入索引…")
 
+        # Step 2: 批量写入 images 表
         image_rows = []
         folder_set: set[str] = set()
         for i, f in enumerate(all_files):
             image_rows.append((
-                f["full_path"], f["folder_path"], f["folder_name"],
-                f["file_name"], int(f["last_modified"]),
+                f["full_path"],
+                f["folder_path"],
+                f["folder_name"],
+                f["file_name"],
+                int(f["last_modified"]),
             ))
             folder_set.add(f["folder_path"])
             if i % 200 == 0:
                 self.progress.emit(i, total)
+
         self.progress.emit(total, total)
 
-        self._db.import_images(image_rows)
+        n_images = self._db.import_images(image_rows)
 
+        # Step 3: 提取文件夹码
+        # 从文件夹路径的每一层提取 4 位数字（69码后四位通常在父文件夹名中）
         self.status_message.emit("正在提取文件夹码…")
         code_rows = []
+        seen = set()  # 去重 (folder_path, code)
         for folder_path in folder_set:
-            codes = CODE_RE.findall(os.path.basename(folder_path))
-            for c in codes:
-                code_rows.append((folder_path, c))
-        if code_rows:
-            self._db.import_folder_codes(code_rows)
+            parts = folder_path.replace("\\", "/").split("/")
+            for part in parts:
+                codes = CODE_RE.findall(part)
+                for c in codes:
+                    key = (folder_path, c)
+                    if key not in seen:
+                        seen.add(key)
+                        code_rows.append((folder_path, c))
 
+        n_codes = 0
+        if code_rows:
+            n_codes = self._db.import_folder_codes(code_rows)
+
+        # Step 4: 重建产品-文件夹关联
         self.status_message.emit("正在匹配产品…")
         self._db.rebuild_links()
+        n_linked = self._db.get_link_count()
 
         stats = {
-            "files": len(image_rows),
+            "files": n_images,
             "folders": len(folder_set),
-            "codes": len(code_rows),
-            "linked": self._db.get_link_count(),
+            "codes": n_codes,
+            "linked": n_linked,
         }
-        n = os.path.basename(root_path)
         self.status_message.emit(
-            f"{n} — {stats['files']} 张图片, {stats['folders']} 个文件夹"
+            f"完成 — {n_images} 张图片, {len(folder_set)} 个文件夹, "
+            f"{n_linked} 个关联产品"
         )
         return stats
 
